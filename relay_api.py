@@ -32,6 +32,9 @@ MAX_TOTAL = int(float(os.environ.get("RELAY_MAX_GB", "1.7")) * 1024**3)
 MAX_CHUNK = int(os.environ.get("RELAY_MAX_SEGMENT_MB", "128")) * 1024**2
 TTL_SECONDS = int(float(os.environ.get("RELAY_TTL_HOURS", "3")) * 3600)
 MAX_JOBS = max(1, int(os.environ.get("RELAY_MAX_JOBS", "1")))
+# Concurrent HTTP uploads run in Gunicorn threads. Keep one Gunicorn worker:
+# the job registry and Telegram progress are currently process-local.
+MAX_PARALLEL_SEGMENTS = max(1, min(12, int(os.environ.get("RELAY_PARALLEL_UPLOADS", "8"))))
 PROGRESS_ENABLED = os.environ.get("TELEGRAM_PROGRESS_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 PROGRESS_INTERVAL = max(5, min(60, int(os.environ.get("TELEGRAM_PROGRESS_INTERVAL", "7"))))
 # Abandoned uploads should not occupy the single-job slot for hours.
@@ -74,14 +77,14 @@ def _reap_abandoned_uploads():
     folders = []
     with _jobs_lock:
         for job_id, job in list(_jobs.items()):
-            if job["status"] != "uploading":
+            if job["status"] != "uploading" or job.get("inflight"):
                 continue
             if now - job.get("updated", job["created"]) <= UPLOAD_IDLE_SECONDS:
                 continue
             if not job["lock"].acquire(blocking=False):
                 continue
             try:
-                if (job["status"] == "uploading" and
+                if (job["status"] == "uploading" and not job.get("inflight") and
                         now - job.get("updated", job["created"]) > UPLOAD_IDLE_SECONDS):
                     job["status"] = "expired"
                     _jobs.pop(job_id, None)
@@ -135,7 +138,7 @@ def _progress_text(job: dict[str, Any]) -> str:
     title = job.get("title", "Lecture")
     stage = job["status"]
     expected = max(1, job.get("expected", 1))
-    received = job.get("next", 0)
+    received = job.get("received_count", job.get("next", 0))
     uploaded = job.get("bytes", 0) + job.get("inflight_bytes", 0)
     uploaded_mib = uploaded / 1048576
     elapsed = max(1.0, time.time() - job.get("created", time.time()))
@@ -476,8 +479,10 @@ def install_relay_routes(app):
             job_id = secrets.token_urlsafe(18)
             folder = ROOT / job_id
             folder.mkdir(parents=True, exist_ok=False)
+            (folder / "segments").mkdir()
             _jobs[job_id] = {"folder": folder, "created": time.time(), "updated": time.time(), "status": "uploading",
                              "expected": count, "next": 0, "bytes": 0, "inflight_bytes": 0,
+                             "inflight": set(), "received": set(), "received_count": 0,
                              "title": _clean_title(body.get("title")),
                              "download_token": secrets.token_urlsafe(24), "lock": threading.Lock()}
         if PROGRESS_ENABLED:
@@ -499,6 +504,8 @@ def install_relay_routes(app):
             try:
                 if job["status"] != "uploading":
                     return _error("Cannot cancel a job already converting or sending", 409)
+                if job.get("inflight"):
+                    return _error("Segment requests still in progress; retry shortly", 409)
                 job["status"] = "cancelled"
                 _jobs.pop(job_id, None)
                 folder = job["folder"]
@@ -510,54 +517,103 @@ def install_relay_routes(app):
 
     @app.post("/api/relay/<job_id>/segment/<int:index>")
     def relay_segment(job_id, index):
+        """Parallel, out-of-order TS segments, serialized *only* for final append.
+
+        Each request has a distinct .part file; counters and append pointer are
+        protected by the job lock. No writes to input.ts occur out of order.
+        """
         if not _authorized():
             return _error("Invalid upload key", 401)
         job = _job(job_id)
         if not job:
             return _error("Unknown or expired job", 404)
+        content_length = request.content_length
+        if content_length is not None and (content_length <= 0 or content_length > MAX_CHUNK):
+            return _error("Segment too large or empty", 413)
+        if index < 0 or index >= job["expected"]:
+            return _error("Segment index out of range", 400)
+
+        # Reserve an index, preventing concurrent duplicates. Do NOT hold this
+        # lock during a network upload or it would serialize all 6 requests.
         with job["lock"]:
-            if job["status"] != "uploading" or index != job["next"]:
-                return _error("Unexpected segment index or job already closed", 409)
-            content_length = request.content_length
-            if content_length is not None and (content_length <= 0 or content_length > MAX_CHUNK):
-                return _error("Segment too large or empty", 413)
-            if job["bytes"] >= MAX_TOTAL:
-                return _error("Job size limit reached", 413)
-            total = 0
-            part = job["folder"] / "incoming.part"
-            try:
-                if shutil.disk_usage(ROOT).free < 250*1024**2:
-                    return _error("Railway disk nearly full", 507)
-                # Stage one segment first, so interrupted/oversized uploads cannot
-                # corrupt already-accepted bytes in input.ts.
-                with part.open("wb") as incoming:
-                    first = True
-                    while True:
-                        chunk = request.stream.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        if first and index == 0 and not (len(chunk) >= 189 and chunk[0] == 0x47 and chunk[188] == 0x47):
-                            return _error("Not MPEG-TS; HLS fMP4/DRM unsupported", 415)
-                        first = False
-                        total += len(chunk)
-                        job["inflight_bytes"] = total
-                        if total > MAX_CHUNK or job["bytes"] + total > MAX_TOTAL:
-                            return _error("Job/segment exceeds size limit", 413)
-                        incoming.write(chunk)
-                if total == 0:
-                    return _error("Empty segment", 400)
-                with (job["folder"] / "input.ts").open("ab") as output, part.open("rb") as incoming:
-                    shutil.copyfileobj(incoming, output, 1024 * 1024)
-                job["next"] += 1
+            if job["status"] != "uploading":
+                return _error("Job is not uploading", 409)
+            if index in job["inflight"] or index in job["received"]:
+                return _error("Duplicate segment", 409)
+            if len(job["inflight"]) >= MAX_PARALLEL_SEGMENTS:
+                return _error("Too many concurrent segment requests", 429)
+            job["inflight"].add(index)
+            job["updated"] = time.time()
+
+        part = job["folder"] / "segments" / f"{index:06d}.part"
+        ready = job["folder"] / "segments" / f"{index:06d}.ts"
+        total = 0
+        held = 0
+        committed = False
+        try:
+            if shutil.disk_usage(ROOT).free < 250 * 1024**2:
+                return _error("Railway disk nearly full", 507)
+            with part.open("xb") as incoming:
+                first = True
+                while True:
+                    chunk = request.stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    if first and index == 0 and (len(chunk) < 189 or
+                                                    chunk[0] != 0x47 or chunk[188] != 0x47):
+                        return _error("Not MPEG-TS; fMP4/DRM unsupported", 415)
+                    first = False
+                    with job["lock"]:
+                        if (total + len(chunk) > MAX_CHUNK or
+                                job["bytes"] + job["inflight_bytes"] + len(chunk) > MAX_TOTAL):
+                            return _error("Job/segment size limit exceeded", 413)
+                        job["inflight_bytes"] += len(chunk)
+                        job["updated"] = time.time()
+                        held += len(chunk)
+                    incoming.write(chunk)
+                    total += len(chunk)
+            if total == 0:
+                return _error("Empty segment", 400)
+            part.replace(ready)
+
+            with job["lock"]:
+                if job["status"] != "uploading":
+                    return _error("Job closed while uploading", 409)
+                # Account for this segment exactly once; shared in-flight byte
+                # budget is released after acceptance.
+                job["inflight_bytes"] -= held
+                held = 0
                 job["bytes"] += total
-                job["inflight_bytes"] = 0
+                job["received"].add(index)
+                job["received_count"] = len(job["received"])
+
+                # Append only the contiguous prefix. Out-of-order segments
+                # remain on disk until missing earlier ones arrive.
+                with (job["folder"] / "input.ts").open("ab") as output:
+                    while job["next"] in job["received"]:
+                        segment_file = job["folder"] / "segments" / f"{job['next']:06d}.ts"
+                        with segment_file.open("rb") as segment_data:
+                            shutil.copyfileobj(segment_data, output, 1024 * 1024)
+                        segment_file.unlink(missing_ok=True)
+                        job["next"] += 1
                 job["updated"] = time.time()
-                return jsonify(received=job["next"], total=job["expected"], bytes=job["bytes"])
-            except OSError:
-                return _error("Disk write failed", 507)
-            finally:
-                job["inflight_bytes"] = 0
-                part.unlink(missing_ok=True)
+                committed = True
+                return jsonify(received=job["received_count"], total=job["expected"],
+                               bytes=job["bytes"], contiguous=job["next"])
+        except OSError:
+            with job["lock"]:
+                job["status"] = "failed"
+                job["error"] = "Disk write failed during segment transfer"
+                job["updated"] = time.time()
+            return _error("Disk write failed", 507)
+        finally:
+            with job["lock"]:
+                job["inflight"].discard(index)
+                if held:
+                    job["inflight_bytes"] = max(0, job["inflight_bytes"] - held)
+            part.unlink(missing_ok=True)
+            if not committed:
+                ready.unlink(missing_ok=True)
 
     @app.post("/api/relay/<job_id>/finish")
     def relay_finish(job_id):
@@ -569,8 +625,9 @@ def install_relay_routes(app):
         with job["lock"]:
             if job["status"] != "uploading":
                 return _error("Job is not uploading", 409)
-            if job["next"] != job["expected"]:
-                return _error(f"Incomplete upload: {job['next']}/{job['expected']}", 409)
+            if (job["received_count"] != job["expected"] or
+                    job["next"] != job["expected"] or job["inflight"]):
+                return _error(f"Incomplete upload: {job['received_count']}/{job['expected']}", 409)
             job["status"] = "processing"
             job["updated"] = time.time()
             threading.Thread(target=_convert, args=(job_id,), daemon=True).start()
@@ -583,7 +640,7 @@ def install_relay_routes(app):
         job = _job(job_id)
         if not job:
             return _error("Unknown/expired job", 404)
-        res = {"status": job["status"], "received": job["next"], "total": job["expected"],
+        res = {"status": job["status"], "received": job.get("received_count", job["next"]), "total": job["expected"],
                "bytes": job["bytes"], "title": job["title"]}
         if job["status"] == "telegram_sending":
             res["telegram_uploaded"] = job.get("telegram_uploaded", 0)
