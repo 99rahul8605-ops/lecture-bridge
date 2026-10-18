@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.1.0
+// @version      2.2.0
 // @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
@@ -127,7 +127,12 @@
       if (!r.ok) throw new Error(body.error || `Status HTTP ${r.status}`);
       if (body.status === 'sent') return body;
       if (body.status === 'failed') throw new Error(body.error || 'Railway conversion / Telegram send failed');
-      if (body.status === 'telegram_sending') say('MP4 ready. Sending video to Telegram…');
+      if (body.status === 'telegram_sending') {
+        const sent = body.telegram_uploaded || 0;
+        const total = body.telegram_total || 0;
+        const pct = total ? Math.round(sent / total * 100) : 0;
+        say(`Telegram upload ${pct}% • ${(sent / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MiB. Telegram chat mein bhi live progress dekho.`);
+      }
       else if (attempt % 5 === 0) say('Railway converting media to MP4…');
     }
     throw new Error('Timed out waiting for MP4 conversion');
