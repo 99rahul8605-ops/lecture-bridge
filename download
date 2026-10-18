@@ -1,0 +1,8 @@
+.git
+.railway
+__pycache__
+*.pyc
+*.zip
+*.ts
+*.mp4
+*.env

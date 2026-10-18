@@ -1,0 +1,5 @@
+.env
+.railway/
+__pycache__/
+*.ts
+*.mp4
