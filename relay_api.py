@@ -27,6 +27,10 @@ MAX_TOTAL = int(float(os.environ.get("RELAY_MAX_GB", "1.7")) * 1024**3)
 MAX_CHUNK = int(os.environ.get("RELAY_MAX_SEGMENT_MB", "128")) * 1024**2
 TTL_SECONDS = int(float(os.environ.get("RELAY_TTL_HOURS", "3")) * 3600)
 MAX_JOBS = max(1, int(os.environ.get("RELAY_MAX_JOBS", "1")))
+# Abandoned uploads should not occupy the single-job slot for hours.
+UPLOAD_IDLE_SECONDS = int(
+    max(1, min(120, float(os.environ.get("RELAY_UPLOAD_IDLE_MINUTES", "15")))) * 60
+)
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
@@ -54,17 +58,49 @@ def _job(job_id: str):
         return _jobs.get(job_id)
 
 
+def _reap_abandoned_uploads():
+    """Reclaim idle uploads only; never touch conversion or Telegram sending.
+
+    A nonblocking job lock prevents deleting files during a segment write.
+    """
+    now = time.time()
+    folders = []
+    with _jobs_lock:
+        for job_id, job in list(_jobs.items()):
+            if job["status"] != "uploading":
+                continue
+            if now - job.get("updated", job["created"]) <= UPLOAD_IDLE_SECONDS:
+                continue
+            if not job["lock"].acquire(blocking=False):
+                continue
+            try:
+                if (job["status"] == "uploading" and
+                        now - job.get("updated", job["created"]) > UPLOAD_IDLE_SECONDS):
+                    job["status"] = "expired"
+                    _jobs.pop(job_id, None)
+                    folders.append(job["folder"])
+            finally:
+                job["lock"].release()
+    for folder in folders:
+        shutil.rmtree(folder, ignore_errors=True)
+    return len(folders)
+
+
 def _purge_loop():
     while True:
-        time.sleep(120)
+        time.sleep(30)
+        _reap_abandoned_uploads()
         current = time.time()
+        folders = []
         with _jobs_lock:
             expired = [key for key, job in _jobs.items()
-                       if job["status"] not in ("processing", "telegram_sending")
+                       if job["status"] in ("sent", "failed", "cancelled")
                        and current - job.get("updated", job["created"]) > TTL_SECONDS]
             for key in expired:
                 job = _jobs.pop(key)
-                shutil.rmtree(job["folder"], ignore_errors=True)
+                folders.append(job["folder"])
+        for folder in folders:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 def _telegram_setup_error() -> str | None:
@@ -195,9 +231,16 @@ def install_relay_routes(app):
         count = body.get("segments")
         if type(count) is not int or not (1 <= count <= 10000):
             return _error("Invalid segment count", 400)
+        # Free abandoned upload slots immediately, instead of waiting for the timer.
+        _reap_abandoned_uploads()
         with _jobs_lock:
             if sum(job["status"] in ("uploading", "processing", "telegram_sending") for job in _jobs.values()) >= MAX_JOBS:
-                return _error("Too many active jobs", 429)
+                active = next(
+                    (job["status"] for job in _jobs.values()
+                     if job["status"] in ("uploading", "processing", "telegram_sending")), "busy"
+                )
+                return jsonify(error=f"Job busy ({active}). Wait for it to finish, or cancel an abandoned upload.",
+                               active_status=active), 429
             job_id = secrets.token_urlsafe(18)
             folder = ROOT / job_id
             folder.mkdir(parents=True, exist_ok=False)
@@ -206,6 +249,30 @@ def install_relay_routes(app):
                              "title": _clean_title(body.get("title")),
                              "download_token": secrets.token_urlsafe(24), "lock": threading.Lock()}
         return jsonify(job_id=job_id, status="uploading"), 201
+
+    @app.post("/api/relay/<job_id>/cancel")
+    def relay_cancel(job_id):
+        """Job holder can cancel an upload, not conversion or Telegram sending."""
+        if not _authorized():
+            return _error("Invalid upload key", 401)
+        folder = None
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if not job:
+                return _error("Unknown or expired job", 404)
+            if not job["lock"].acquire(blocking=False):
+                return _error("Segment upload in progress; try again", 409)
+            try:
+                if job["status"] != "uploading":
+                    return _error("Cannot cancel a job already converting or sending", 409)
+                job["status"] = "cancelled"
+                _jobs.pop(job_id, None)
+                folder = job["folder"]
+            finally:
+                job["lock"].release()
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+        return jsonify(status="cancelled"), 200
 
     @app.post("/api/relay/<job_id>/segment/<int:index>")
     def relay_segment(job_id, index):

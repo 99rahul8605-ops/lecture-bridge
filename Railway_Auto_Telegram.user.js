@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.0.0
+// @version      2.1.0
 // @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
@@ -136,6 +136,8 @@
   button.addEventListener('click', async () => {
     const key = ''; // No-key mode. Server must set RELAY_REQUIRE_UPLOAD_KEY=0.
     button.disabled = true;
+    let uploadJobId = null;
+    let transferFinished = false;
     try {
       say('Finding authorized HLS playlist…');
       const {url, body} = await findManifest();
@@ -144,6 +146,7 @@
         document.querySelector('h1')?.textContent || document.title || 'Lecture').trim().slice(0, 140);
       say(`Found ${segments.length} segments for ${title}. Starting Railway upload…`);
       const job = await api('/api/relay/start', key, {segments: segments.length, title});
+      uploadJobId = job.job_id;
       // Pipeline: fetch up to 3 authorized segments concurrently, upload to Railway
       // in HLS playlist order (the Railway backend requires index 0,1,2,...).
       // This overlaps CDN fetching with upload. It does not bypass CDN authorization.
@@ -185,10 +188,20 @@
         say(`Upload ${i + 1}/${segments.length} • ${(bytes/1048576).toFixed(1)} MiB • ${rate} MiB/s. Do not close tab.`);
       }
       await api(`/api/relay/${encodeURIComponent(job.job_id)}/finish`, key, {});
+      transferFinished = true;
       say('All segments uploaded. Railway converting to MP4…');
       const result = await poll(job.job_id, key);
       say(`✅ Sent to Telegram: ${result.title}.mp4 (check your bot chat)`);
     } catch (e) {
+      // Free the server job slot on a failed browser upload.
+      // Never cancel once conversion or Telegram delivery has started.
+      if (uploadJobId && !transferFinished) {
+        try {
+          await api(`/api/relay/${encodeURIComponent(uploadJobId)}/cancel`, key, {});
+        } catch (cancelErr) {
+          console.warn('[Railway upload cleanup]', cancelErr);
+        }
+      }
       say(`Failed: ${e.message || e}`);
       console.error('[Railway MP4 link]', e);
     } finally {
