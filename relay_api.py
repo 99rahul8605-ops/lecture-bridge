@@ -6,12 +6,13 @@ already authorized to read. No DRM support, signature forging, or cookie replay.
 from __future__ import annotations
 
 import hmac
+import asyncio
+import re
 import logging
 import os
 import secrets
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -59,10 +60,63 @@ def _purge_loop():
         current = time.time()
         with _jobs_lock:
             expired = [key for key, job in _jobs.items()
-                       if job["status"] != "processing" and current - job["created"] > TTL_SECONDS]
+                       if job["status"] not in ("processing", "telegram_sending")
+                       and current - job.get("updated", job["created"]) > TTL_SECONDS]
             for key in expired:
                 job = _jobs.pop(key)
                 shutil.rmtree(job["folder"], ignore_errors=True)
+
+
+def _telegram_setup_error() -> str | None:
+    if not (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")):
+        return "Missing BOT_TOKEN in server .env"
+    if not os.getenv("TELEGRAM_API_ID", "").isdigit():
+        return "Missing/invalid TELEGRAM_API_ID in server .env"
+    if not os.getenv("TELEGRAM_API_HASH"):
+        return "Missing TELEGRAM_API_HASH in server .env"
+    chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not (re.fullmatch(r"-?\d+", chat) or re.fullmatch(r"@[a-zA-Z0-9_]{5,32}", chat)):
+        return "Missing/invalid TELEGRAM_CHAT_ID (numeric ID or @username) in server .env"
+    return None
+
+
+def _clean_title(raw: Any) -> str:
+    """Preserve page video_name for captions; don't trust it for filesystem paths."""
+    if not isinstance(raw, str):
+        return "Lecture"
+    title = re.sub(r"[\x00-\x1f\x7f]", " ", raw).strip()
+    return (title[:140].strip() or "Lecture")
+
+
+def _safe_filename(title: str) -> str:
+    base = re.sub(r'[\\/:*?"<>|]', "-", title)
+    base = re.sub(r"\s+", " ", base).strip(" .-")
+    return (base[:115].strip(" .-") or "Lecture") + ".mp4"
+
+
+async def _telegram_send(job: dict[str, Any], file_path: Path):
+    """Send large MP4 directly via the bot's MTProto session (no Bot API 50MB HTTP limit)."""
+    # Import lazily: backend may still answer health checks before Telegram is configured.
+    from telethon import TelegramClient
+    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    api_id = int(os.environ["TELEGRAM_API_ID"])
+    api_hash = os.environ["TELEGRAM_API_HASH"]
+    chat_text = os.environ["TELEGRAM_CHAT_ID"].strip()
+    chat_id = int(chat_text) if re.fullmatch(r"-?\d+", chat_text) else chat_text
+    # Dedicated session file; don't share a .session file with a running bot.
+    session = str(ROOT / "lecture_relay_bot")
+    client = TelegramClient(session, api_id, api_hash)
+    try:
+        await client.start(bot_token=token)
+        await client.send_file(
+            chat_id,
+            str(file_path),
+            caption=job["title"],
+            supports_streaming=True,
+            force_document=False,
+        )
+    finally:
+        await client.disconnect()
 
 
 def _convert(job_id: str):
@@ -70,8 +124,9 @@ def _convert(job_id: str):
     if not job:
         return
     src = job["folder"] / "input.ts"
-    dest = job["folder"] / "lecture.mp4"
-    base = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "mpegts", "-i", str(src)]
+    dest = job["folder"] / _safe_filename(job["title"])
+    base = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+            "-f", "mpegts", "-i", str(src)]
     methods = [
         base + ["-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", str(dest)],
         base + ["-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
@@ -79,26 +134,32 @@ def _convert(job_id: str):
     ]
     try:
         err = ""
+        converted = False
         for cmd in methods:
             try:
                 dest.unlink(missing_ok=True)
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45*60)
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45 * 60)
                 if proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
                     job["bytes_output"] = dest.stat().st_size
-                    job["status"] = "ready"
-                    src.unlink(missing_ok=True)
-                    return
+                    converted = True
+                    break
                 err = (proc.stderr or f"ffmpeg exited {proc.returncode}")[-500:]
             except (subprocess.TimeoutExpired, OSError) as exc:
                 err = str(exc)
-        job["status"] = "failed"
-        job["error"] = "MP4 conversion failed: " + err
+        if not converted:
+            raise RuntimeError("MP4 conversion failed: " + err)
+        src.unlink(missing_ok=True)
+        job["status"] = "telegram_sending"
+        job["updated"] = time.time()
+        asyncio.run(_telegram_send(job, dest))
+        job["status"] = "sent"
+        job["updated"] = time.time()
+        dest.unlink(missing_ok=True)  # Avoid holding the full MP4 after Telegram delivery.
     except Exception as exc:
         job["status"] = "failed"
-        job["error"] = str(exc)
-    finally:
-        if job["status"] != "ready":
-            log.warning("Relay conversion failed for %s: %s", job_id, job.get("error", "unknown"))
+        job["updated"] = time.time()
+        job["error"] = ("Telegram delivery / conversion failed: " + str(exc))[:500]
+        log.exception("Lecture transfer failed for %s", job_id)
 
 
 def install_relay_routes(app):
@@ -127,18 +188,22 @@ def install_relay_routes(app):
     def relay_start():
         if not _authorized():
             return _error("Invalid upload key or RELAY_UPLOAD_KEY not configured", 401)
+        error = _telegram_setup_error()
+        if error:
+            return _error(error, 503)
         body = request.get_json(silent=True) or {}
         count = body.get("segments")
         if type(count) is not int or not (1 <= count <= 10000):
             return _error("Invalid segment count", 400)
         with _jobs_lock:
-            if sum(job["status"] in ("uploading", "processing") for job in _jobs.values()) >= MAX_JOBS:
+            if sum(job["status"] in ("uploading", "processing", "telegram_sending") for job in _jobs.values()) >= MAX_JOBS:
                 return _error("Too many active jobs", 429)
             job_id = secrets.token_urlsafe(18)
             folder = ROOT / job_id
             folder.mkdir(parents=True, exist_ok=False)
-            _jobs[job_id] = {"folder": folder, "created": time.time(), "status": "uploading",
+            _jobs[job_id] = {"folder": folder, "created": time.time(), "updated": time.time(), "status": "uploading",
                              "expected": count, "next": 0, "bytes": 0,
+                             "title": _clean_title(body.get("title")),
                              "download_token": secrets.token_urlsafe(24), "lock": threading.Lock()}
         return jsonify(job_id=job_id, status="uploading"), 201
 
@@ -183,6 +248,7 @@ def install_relay_routes(app):
                     shutil.copyfileobj(incoming, output, 1024 * 1024)
                 job["next"] += 1
                 job["bytes"] += total
+                job["updated"] = time.time()
                 return jsonify(received=job["next"], total=job["expected"], bytes=job["bytes"])
             except OSError:
                 return _error("Disk write failed", 507)
@@ -202,6 +268,7 @@ def install_relay_routes(app):
             if job["next"] != job["expected"]:
                 return _error(f"Incomplete upload: {job['next']}/{job['expected']}", 409)
             job["status"] = "processing"
+            job["updated"] = time.time()
             threading.Thread(target=_convert, args=(job_id,), daemon=True).start()
         return jsonify(status="processing"), 202
 
@@ -213,27 +280,11 @@ def install_relay_routes(app):
         if not job:
             return _error("Unknown/expired job", 404)
         res = {"status": job["status"], "received": job["next"], "total": job["expected"],
-               "bytes": job["bytes"]}
-        if job["status"] == "ready":
-            # request.host_url is set by Railway reverse proxy; avoid host header poisoning
-            domain = os.environ.get("RELAY_PUBLIC_BASE_URL", "").rstrip("/")
-            if not domain.startswith("https://"):
-                return _error("RELAY_PUBLIC_BASE_URL must be set to your HTTPS public domain", 503)
-            res["download_url"] = f"{domain}/relay-download/{job_id}/{job['download_token']}.mp4"
-            res["bytes_output"] = job.get("bytes_output", 0)
+               "bytes": job["bytes"], "title": job["title"]}
+        if job["status"] == "sent":
+            res["message"] = "Video sent to your Telegram chat"
         if job["status"] == "failed":
             res["error"] = job.get("error", "Conversion failed")
         return jsonify(res)
-
-    @app.route("/relay-download/<job_id>/<token>.mp4", methods=["GET", "HEAD"])
-    def relay_download(job_id, token):
-        job = _job(job_id)
-        if not job or job["status"] != "ready" or not hmac.compare_digest(job["download_token"], token):
-            return _error("Link expired or not found", 404)
-        file_path = job["folder"] / "lecture.mp4"
-        if not file_path.is_file():
-            return _error("File not found", 404)
-        return send_file(file_path, as_attachment=True, download_name="lecture.mp4",
-                         mimetype="video/mp4", conditional=True, max_age=0)
 
     threading.Thread(target=_purge_loop, daemon=True).start()
