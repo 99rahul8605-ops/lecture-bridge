@@ -6,7 +6,7 @@
  */
 (() => {
   'use strict';
-  let RELAY = ''; // Prompted on each button click; no hard-coded Ubuntu container
+  let RELAY = 'https://ubuntu-production-9d09.up.railway.app'; // Your public bridge domain
   const WIDGET_ID = 'railway-lecture-link-v1';
   if (document.getElementById(WIDGET_ID)) return;
 
@@ -100,7 +100,7 @@
   async function api(path, secret, data) {
     const options = {
       method: 'POST',
-      headers: {'X-Relay-Key': secret, 'Content-Type': data instanceof ArrayBuffer
+      headers: {...(secret ? {'X-Relay-Key': secret} : {}), 'Content-Type': data instanceof ArrayBuffer
         ? 'application/octet-stream' : 'application/json'},
       body: data instanceof ArrayBuffer ? data : JSON.stringify(data)
     };
@@ -116,7 +116,7 @@
     for (let attempt = 0; attempt < 540; attempt++) {
       await wait(2000);
       const r = await fetch(`${RELAY}/api/relay/${encodeURIComponent(jobId)}/status`, {
-        headers: {'X-Relay-Key': key}
+        headers: key ? {'X-Relay-Key': key} : {}
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(body.error || `Status HTTP ${r.status}`);
@@ -128,17 +128,7 @@
   }
 
   button.addEventListener('click', async () => {
-    const typed = prompt('Paste your NEW Railway lecture-bridge HTTPS domain (not the Ubuntu login domain):', RELAY || 'https://');
-    if (!typed) return;
-    try {
-      const u = new URL(typed.trim());
-      if (u.protocol !== 'https:' || u.username || u.password || u.search || u.hash) {
-        throw new Error('Use only a trusted HTTPS bridge origin');
-      }
-      RELAY = u.origin;
-    } catch (e) { say('Invalid Railway bridge URL: ' + e.message); return; }
-    const key = prompt('Enter Railway RELAY_UPLOAD_KEY (not Telegram bot token):');
-    if (!key) return;
+    const key = ''; // No-key mode. Server must set RELAY_REQUIRE_UPLOAD_KEY=0.
     button.disabled = true;
     linkInput.hidden = true;
     copyButton.hidden = true;

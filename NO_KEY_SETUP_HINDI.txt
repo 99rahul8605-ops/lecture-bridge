@@ -1,0 +1,12 @@
+Railway Lecture Bridge - optional no-key mode
+
+Security warning: Public URL is not access control. Anyone who learns the endpoint can upload videos and consume your Railway quota. Origin/CORS is not protection against curl or server requests. Keep RELAY_MAX_JOBS=1 and RELAY_MAX_GB=0.7 and monitor Railway usage. You can enable auth again by setting RELAY_REQUIRE_UPLOAD_KEY=1.
+
+Current container (/lecture-bridge) installation:
+1) Replace /lecture-bridge/relay_api.py with the updated relay_api.py.
+2) Add RELAY_REQUIRE_UPLOAD_KEY=0 to /lecture-bridge/.env.
+3) Restart the screen Gunicorn process after source .env.
+4) Replace Chrome Snippet with Railway_Link_Snippet.js. It uses https://ubuntu-production-9d09.up.railway.app directly and asks for no key.
+5) Test /health and then the button.
+
+Never commit .env / bot secrets to GitHub.

@@ -35,6 +35,10 @@ def _allowed_origin() -> str:
 
 
 def _authorized() -> bool:
+    # User-opted private-key-free mode. NOT secure for public Internet: any
+    # HTTP client can upload, and CORS is only a browser-side safeguard.
+    if os.environ.get("RELAY_REQUIRE_UPLOAD_KEY", "1").strip().lower() in ("0", "false", "no"):
+        return True
     key = os.environ.get("RELAY_UPLOAD_KEY", "")
     provided = request.headers.get("X-Relay-Key", "")
     return len(key) >= 24 and hmac.compare_digest(key, provided)
