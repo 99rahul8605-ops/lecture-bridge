@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.2.0
+// @version      2.4.0
 // @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
@@ -11,13 +11,13 @@
 /*
  * Chrome DevTools > Sources > Snippets > Ctrl+Enter
  * Browser -> Railway -> MP4 -> direct Telegram delivery (no copied URL).
- * Optimized: up to 3 concurrent browser fetches and ordered upload. No DRM bypass.
+ * 1/2/3 parallel browser-to-VPS lanes; VPS commits original HLS segment order. No DRM bypass.
  * Only for media the user is allowed to export. No DRM/signature bypass.
  * Existing signed HLS links must already work in the page via normal CORS fetch.
  */
 (() => {
   'use strict';
-  let RELAY = 'https://ubuntu-production-9d09.up.railway.app'; // Your public bridge domain
+  let RELAY = 'https://upload.bingolink.site'; // Ubuntu VPS Cloudflare Tunnel
   const WIDGET_ID = 'railway-lecture-link-v1';
   if (document.getElementById(WIDGET_ID)) return;
 
@@ -34,18 +34,27 @@
     #${WIDGET_ID} .relay-message { background:#122139!important;color:white!important;
       border-radius:8px!important;padding:9px!important;overflow-wrap:anywhere!important;
       max-width:370px!important; }
-    #${WIDGET_ID} textarea { width:340px!important;max-width:85vw!important;height:65px!important;
-      padding:7px!important;background:white!important;color:#111!important;border-radius:5px!important; }
+    #${WIDGET_ID} select { font:13px system-ui!important; border-radius:7px!important;
+      padding:6px 10px!important; color:#111!important; background:#fff!important; }
   `;
 
   const root = document.createElement('div');
   root.id = WIDGET_ID;
   const button = document.createElement('button');
   button.textContent = '🔗 📤 Send MP4 to Telegram';
+  const lanes = document.createElement('select');
+  lanes.title = 'Parallel upload lanes';
+  for (const n of [1, 2, 3]) {
+    const opt = document.createElement('option');
+    opt.value = String(n);
+    opt.textContent = `${n} upload lane${n === 1 ? '' : 's'}`;
+    lanes.appendChild(opt);
+  }
+  lanes.value = '2'; // Default: test 2 vs old 1; 3 is optional.
   const status = document.createElement('div');
   status.className = 'relay-message';
   status.hidden = true;
-  root.append(button, status);
+  root.append(lanes, button, status);
   (document.head || document.documentElement).appendChild(css);
   document.body.appendChild(root);
 
@@ -141,6 +150,7 @@
   button.addEventListener('click', async () => {
     const key = ''; // No-key mode. Server must set RELAY_REQUIRE_UPLOAD_KEY=0.
     button.disabled = true;
+    lanes.disabled = true;
     let uploadJobId = null;
     let transferFinished = false;
     try {
@@ -152,46 +162,43 @@
       say(`Found ${segments.length} segments for ${title}. Starting Railway upload…`);
       const job = await api('/api/relay/start', key, {segments: segments.length, title});
       uploadJobId = job.job_id;
-      // Pipeline: fetch up to 3 authorized segments concurrently, upload to Railway
-      // in HLS playlist order (the Railway backend requires index 0,1,2,...).
-      // This overlaps CDN fetching with upload. It does not bypass CDN authorization.
-      const PREFETCH = 3;
-      const pending = new Map();
+      // Bounded parallel pipeline. Each lane fetches and posts one segment at a time.
+      // Server accepts out-of-order indexes, but commits input.ts strictly 0,1,2,...
+      const CONCURRENCY = Math.max(1, Math.min(3, Number(lanes.value) || 2));
       const began = performance.now();
+      let nextIndex = 0;
+      let completed = 0;
       let bytes = 0;
-
-      const schedule = (index) => {
-        if (index >= segments.length || pending.has(index)) return;
-        // Always handle early failures to avoid unhandled promise rejections.
-        const p = fetch(segments[index], {mode: 'cors', credentials: 'same-origin'})
-          .then(async response => {
-            if (!response.ok) throw new Error(`Video segment ${index + 1} HTTP ${response.status}`);
-            return response.arrayBuffer();
-          })
-          .then(data => ({ok: true, data}), error => ({ok: false, error}));
-        pending.set(index, p);
-      };
-
-      for (let i = 0; i < Math.min(PREFETCH, segments.length); i++) schedule(i);
-      for (let i = 0; i < segments.length; i++) {
-        const result = await pending.get(i);
-        pending.delete(i);
-        if (!result.ok) throw result.error;
-        const data = result.data;
-        if (i === 0) {
-          const x = new Uint8Array(data);
-          if (x.length < 189 || x[0] !== 0x47 || x[188] !== 0x47) {
-            throw new Error('Not MPEG-TS segments; other container formats unsupported');
+      let failure = null;
+      say(`${CONCURRENCY} upload lane(s) running • ${segments.length} segments`);
+      async function transferLane() {
+        while (!failure) {
+          const i = nextIndex++;
+          if (i >= segments.length) return;
+          try {
+            const response = await fetch(segments[i], {mode: 'cors', credentials: 'same-origin'});
+            if (!response.ok) throw new Error(`Video segment ${i + 1} HTTP ${response.status}`);
+            const data = await response.arrayBuffer();
+            if (i === 0) {
+              const x = new Uint8Array(data);
+              if (x.length < 189 || x[0] !== 0x47 || x[188] !== 0x47)
+                throw new Error('Not MPEG-TS segments; encrypted/fMP4 formats unsupported');
+            }
+            await api(`/api/relay/${encodeURIComponent(job.job_id)}/segment/${i}`, key, data);
+            completed++;
+            bytes += data.byteLength;
+            const secs = Math.max((performance.now() - began) / 1000, 1);
+            const rate = (bytes / 1048576 / secs).toFixed(2);
+            say(`${CONCURRENCY} lanes • Upload ${completed}/${segments.length} • ${(bytes/1048576).toFixed(1)} MiB • ${rate} MiB/s. Keep tab open.`);
+          } catch (error) {
+            failure ||= error;
+            return;
           }
         }
-        // Start fetching a future segment while we upload this one.
-        schedule(i + PREFETCH);
-        await api(`/api/relay/${encodeURIComponent(job.job_id)}/segment/${i}`, key, data);
-        bytes += data.byteLength;
-        const secs = Math.max((performance.now() - began) / 1000, 1);
-        const rate = (bytes / 1048576 / secs).toFixed(2);
-        say(`Upload ${i + 1}/${segments.length} • ${(bytes/1048576).toFixed(1)} MiB • ${rate} MiB/s. Do not close tab.`);
       }
+      // Wait for all current transfers to settle before finish or cancel.
+      await Promise.all(Array.from({length: Math.min(CONCURRENCY, segments.length)}, transferLane));
+      if (failure) throw failure;
       await api(`/api/relay/${encodeURIComponent(job.job_id)}/finish`, key, {});
       transferFinished = true;
       say('All segments uploaded. Railway converting to MP4…');
@@ -211,6 +218,7 @@
       console.error('[Railway MP4 link]', e);
     } finally {
       button.disabled = false;
+      lanes.disabled = false;
     }
   });
 

@@ -34,7 +34,7 @@ TTL_SECONDS = int(float(os.environ.get("RELAY_TTL_HOURS", "3")) * 3600)
 MAX_JOBS = max(1, int(os.environ.get("RELAY_MAX_JOBS", "1")))
 # Concurrent HTTP uploads run in Gunicorn threads. Keep one Gunicorn worker:
 # the job registry and Telegram progress are currently process-local.
-MAX_PARALLEL_SEGMENTS = max(1, min(12, int(os.environ.get("RELAY_PARALLEL_UPLOADS", "8"))))
+MAX_PARALLEL_SEGMENTS = max(1, min(3, int(os.environ.get("RELAY_PARALLEL_UPLOADS", "2"))))
 PROGRESS_ENABLED = os.environ.get("TELEGRAM_PROGRESS_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 PROGRESS_INTERVAL = max(5, min(60, int(os.environ.get("TELEGRAM_PROGRESS_INTERVAL", "7"))))
 # Abandoned uploads should not occupy the single-job slot for hours.
@@ -517,7 +517,7 @@ def install_relay_routes(app):
 
     @app.post("/api/relay/<job_id>/segment/<int:index>")
     def relay_segment(job_id, index):
-        """Parallel, out-of-order TS segments, serialized *only* for final append.
+        """Up to 3 parallel, out-of-order TS segments; ordered final append.
 
         Each request has a distinct .part file; counters and append pointer are
         protected by the job lock. No writes to input.ts occur out of order.

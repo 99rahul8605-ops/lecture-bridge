@@ -1,0 +1,23 @@
+PASS: 1 segments reverse-order, exact assembly; duplicate rejected; finish gated
+PASS: 2 segments reverse-order, exact assembly; duplicate rejected; finish gated
+PASS: 3 segments reverse-order, exact assembly; duplicate rejected; finish gated
+PASS: 6 segments reverse-order, exact assembly; duplicate rejected; finish gated
+PASS: missing segment blocked finish; late segment accepted in order; invalid index blocked
+Auto Telegram lecture button added.
+PASS: 1 lane(s), peak POSTs=1, 7 segments, correct original IDs, finish/sent
+Auto Telegram lecture button added.
+PASS: 2 lane(s), peak POSTs=2, 7 segments, correct original IDs, finish/sent
+Auto Telegram lecture button added.
+PASS: 3 lane(s), peak POSTs=3, 7 segments, correct original IDs, finish/sent
+Auto Telegram lecture button added.
+[Railway MP4 link] Error: Railway 503: mock server failure
+    at api (evalmachine.<anonymous>:125:29)
+    at runNextTicks (node:internal/process/task_queues:65:5)
+    at listOnTimeout (node:internal/timers:549:9)
+    at process.processTimers (node:internal/timers:523:7)
+    at async transferLane (evalmachine.<anonymous>:187:13)
+    at async Promise.all (index 1)
+    at async evalmachine.<anonymous>:200:7
+    at async check (/mnt/data/Parallel_Lanes_VPS_Test/test_parallel_browser.cjs:60:3)
+    at async /mnt/data/Parallel_Lanes_VPS_Test/test_parallel_browser.cjs:76:51
+PASS: failing upload cancels job and does not finish

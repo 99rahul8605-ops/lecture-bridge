@@ -1,48 +1,45 @@
-# Old manual one-click uploader restored (NOT auto-navigation)
+# 2/3 Parallel Segment Upload Test — Ubuntu VPS
 
-Ye **purana verified uploader code** hai: `Railway_Auto_Telegram.user.js` (version 2.2.0) aur original `app.py`. Ye v3/v2 navigation/catalog code nahi hai. `relay_api.py` ko **change nahi** karta, isliye existing working Telegram group, progress, thumbnail aur conversion implementation jaisi hai waisi rahegi.
+Existing **one-click Send MP4 to Telegram** uploader ka speed test. No automatic batch selection, no new Telegram bot. Website player normal tarike se kholo. This is only for media you are authorized to export, and the script still refuses encrypted HLS/fMP4 unsupported streams.
+
+## Files
+
+- `relay_api.py`: same existing conversion + group progress, but accepts up to 3 out-of-order segment uploads; MPEG-TS assembled **original segment index 0,1,2...** using a bounded memory/disk buffer.
+- `Railway_Auto_Telegram.user.js`: `https://upload.bingolink.site` preset, dropdown with **1 / 2 / 3 upload lanes** (default **2**); old one-click button preserved.
+- `enable_parallel.sh`: configures VPS to allow 3 concurrent segment requests and restarts only port 8090's Gunicorn master (loads new .env). No other bots or Cloudflare Tunnel changes.
+- `test_parallel_server.py` and `test_parallel_browser.cjs`: offline tests.
 
 ## Install
 
-1. GitHub ke `/lecture-bridge` project ke root mein is bundle se **`app.py`, `Railway_Auto_Telegram.user.js`, `restore_manual.sh`** upload/replace karo. Repository ka `.env` GitHub par kabhi upload mat karo.
-2. Railway Ubuntu terminal mein (koi upload/Telegram send currently chal nahi raha ho):
+1. Stop/wait for any **ongoing video upload or Telegram send**. In the GitHub `lecture-bridge` repository, replace `relay_api.py`, `Railway_Auto_Telegram.user.js` and add `enable_parallel.sh`, `test_parallel_server.py` and (optionally) `test_parallel_browser.cjs`.
+2. In Ubuntu VPS terminal:
 
 ```bash
-cd /lecture-bridge
+cd ~/lecture-bridge
 git pull --ff-only
-bash restore_manual.sh
+bash enable_parallel.sh
+curl -sS https://upload.bingolink.site/health
 ```
 
-3. Chrome Tampermonkey mein **VidCloud Auto Catalog Sync** ko **Disable** ya uninstall karo. Script `Lecture Auto Send to Telegram` ka content bundle ke `Railway_Auto_Telegram.user.js` se replace karo; uski sirf ek copy ON rakho.
-4. Website mein lecture normal card se kholkar player play karo. **Send MP4 to Telegram** button ek baar dabao. Telegram group mein progress aur actual video delivery dekho.
+3. In Chrome Tampermonkey replace the **existing one-click uploader** with the new `Railway_Auto_Telegram.user.js`. Keep other auto-catalog worker scripts disabled. Refresh existing lecture player.
+4. Test with **1 lane first**, then same video with **2 lanes** (when no existing transfer running), optionally 3. Compare the actual Chrome→VPS `MiB/s` and Telegram delivery. Default 2 lanes isn't guaranteed faster than 1.
 
-## Kya off hua
+## Safety & performance
 
-- `catalog-control` GNU Screen session stop hota hai; alag bots ko touch nahi karte.
-- `app.py` mein se catalog routes hat jaate hain. Data files, `.env`, `relay_api.py`, secrets, existing queue DB **delete nahi** hote.
-- `VidCloud_Auto_Catalog.user.js` disable **browser mein manually** karna hai. Railway se browser Tampermonkey automatically disable nahi ho sakta.
+- Keep `--workers 1 --threads 16`, `RELAY_MAX_JOBS=1`; `RELAY_PARALLEL_UPLOADS=3` only controls **segment POST concurrency**, not concurrent video jobs.
+- Each segment is saved by index and only its contiguous playlist prefix is appended; no mix-up if segment 2 arrives before segment 0.
+- `finish` returns `409` until all segments are present. A failed upload cancels the job. Original MP4 conversion, thumbnail, Telethon and Telegram progress paths unchanged.
+- A video above your current `.env` `RELAY_MAX_GB=0.7` will still be rejected; that limit is unchanged.
+- Cloudflare Tunnel can still be bottleneck; concurrency is a speed experiment, not a promised 2x/3x throughput.
+- No-key mode (`RELAY_REQUIRE_UPLOAD_KEY=0`) exposes a public upload surface; switch to upload-key auth when possible. This package does not change authorization settings.
+- Existing active jobs are in Gunicorn memory; **never reload while an upload or Telegram delivery is in progress**.
 
-## Speed / 'straight download and upload'
+## Roll back if 2/3 slower
 
-Purana manual userscript **full video pehle PC par save nahi** karta. Authorized unencrypted HLS segments browser mein fetch hote hain aur ek-ek karke Railway ko upload hote rehte hain. Up to 3 segment fetches prefetch hote hain, aur **Railway upload lane 1 hi hoti hai**. Browser tab open rehna hai. Uske baad Railway MPEG-TS ko FFmpeg se MP4 remux/convert karke Telegram ko bhejta hai. True CDN→Telegram direct end-to-end streaming nahi hai. Chrome→Railway ke saath CDN downloading overlap already hota hai. Higher concurrency speed badhane ki guarantee nahi; pehle user tests mein 1 lane better thi.
+Select **`1 upload lane`** in the Tampermonkey dropdown. No VPS restart needed; the new server accepts 1-lane sequential requests too. To fully revert, restore the previous Git commit of these two files in the repository and reload Gunicorn outside an active transfer.
 
-`-c copy` H.264/AAC ke liye already employed by the existing relay conversion; forced re-encoding slow ho sakti hai. Is restoration mein sirf proven manual flow rakha gaya hai, new uncertain optimizations nahi. DRM/license protections bypass nahi kiye gaye.
+## Verified locally
 
-## Tests actually run here
-
-- `node --check Railway_Auto_Telegram.user.js` — JavaScript syntax pass.
-- `python3 -m unittest discover -s . -p test_restore.py -v` — 3 offline rollback checks pass.
-- `node test_pipeline.cjs` — simulated manual click, HLS metadata, four MPEG-TS segments, sequential Railway upload, finish aur `sent` confirmation pass. Ye sirf offline mock hai; real CDN/Railway/Telegram speed is environment se verify nahi hui.
-
-## Quick tests
-
-```bash
-curl -sS http://127.0.0.1:8090/health
-screen -ls
-```
-
-Agar `screen -ls` mein `catalog-control` nahi aur `lecture-bridge` hai, expected. Ensure `app.py` simple `install_relay_routes(app)` wala hai.
-
-## Rollback installer
-
-Script start mein previous `app.py` aur user script ka backup `/tmp/lecture-manual-restore-YYYYMMDD-HHMMSS/` mein banata hai. Agar alag project folders hon toh is installer ko bina change kiye mat chalana. Kabhi running media job ke dauraan Gunicorn HUP mat karna; jobs in-memory hain, transfer interrupt ho sakta hai.
+- Node `--check`, Python `py_compile`.
+- Tests: 1/2/3/6 segment reverse-order server assembly, duplicate/index/missing guards, conversion gated; browser mock for 1/2/3 parallel lanes and error cancellation.
+- **NOT** verified against live VPS, CDN, Telegram network. Final speed and complete Telegram MP4 need user-side test.
