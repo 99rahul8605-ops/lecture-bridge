@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.7.0-background-next
-// @description  Send one authorized lecture to relay, then immediately free browser for the next while Telegram sends in background.
+// @version      2.7.0-resume
+// @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
 // @grant        none
@@ -231,14 +231,43 @@
       const title = (new URLSearchParams(location.search).get('video_name') ||
         document.querySelector('h1')?.textContent || document.title || 'Lecture').trim().slice(0, 140);
       say(`Found ${segments.length} segments for ${title}. Starting Railway upload…`);
-      const job = await api('/api/relay/start', key, {segments: segments.length, title});
+      // Resume identity is stored locally, not a CDN/signed URL and not a Telegram key.
+      // Hash only segment URL PATHS, excluding expiring CDN query-signature values.
+      const videoId = new URLSearchParams(location.search).get('video_id');
+      if (!videoId) throw new Error('Missing lecture video_id for safe resume');
+      const storageKey = `lecture-relay-resume-v1:${videoId}`;
+      const identityParts = [videoId, ...segments.map(u => {
+        const url = new URL(u); return `${url.origin}${url.pathname}`;
+      })];
+      const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(identityParts)));
+      const sourceFingerprint = [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
+      let cache = null;
+      try { cache = JSON.parse(localStorage.getItem(storageKey) || 'null'); } catch (_) {}
+      let resumeKey;
+      if (cache && cache.source_fingerprint === sourceFingerprint && /^[a-f0-9]{48}$/.test(cache.resume_key || '')) {
+        resumeKey = cache.resume_key;
+      } else {
+        const bytes = crypto.getRandomValues(new Uint8Array(24));
+        resumeKey = [...bytes].map(b => b.toString(16).padStart(2,'0')).join('');
+        localStorage.setItem(storageKey, JSON.stringify({resume_key: resumeKey, source_fingerprint: sourceFingerprint}));
+      }
+      const job = await api('/api/relay/start', key, {segments: segments.length, title,
+        resume_key: resumeKey, source_fingerprint: sourceFingerprint});
+      if (job.already_finished) {
+        localStorage.removeItem(storageKey);
+        say(`✅ All ${segments.length} segments safely uploaded; Telegram delivery is already running or complete.`);
+        return;
+      }
+      const cached = new Set(job.received_indices || []);
+      const pendingIndexes = segments.map((_,i) => i).filter(i => !cached.has(i));
+      if (job.resumed && cached.size) say(`♻ Resuming ${title}: ${cached.size}/${segments.length} segments already on Railway.`);
       uploadJobId = job.job_id;
       // Bounded parallel pipeline. Each lane fetches and posts one segment at a time.
       // Server accepts out-of-order indexes, but commits input.ts strictly 0,1,2,...
       const CONCURRENCY = Math.max(1, Math.min(3, Number(lanes.value) || 2));
       const began = performance.now();
       let nextIndex = 0;
-      let downloaded = 0, uploaded = 0;
+      let downloaded = 0, uploaded = cached.size;
       let downloadBytes = 0, uploadBytes = 0;
       let activeDownloads = 0, activeUploads = 0, peakDownloads = 0;
       let failure = null;
@@ -256,8 +285,8 @@
           return `L${laneIndex + 1} ${lane.phase}${current} | last ↓${lastDL} ↑${lastUL}`;
         });
         stats.textContent = [
-          `⬇ CDN download: ${downloaded}/${segments.length} | ${mib(downloadBytes)} MiB | avg ${rate(downloadBytes, elapsedMs)} MiB/s`,
-          `⬆ VPS upload:   ${uploaded}/${segments.length} | ${mib(uploadBytes)} MiB | avg ${rate(uploadBytes, elapsedMs)} MiB/s`,
+          `⬇ CDN download: ${downloaded} NEW | ${mib(downloadBytes)} MiB | avg ${rate(downloadBytes, elapsedMs)} MiB/s`,
+          `⬆ VPS accepted: ${uploaded}/${segments.length} (${cached.size} cached) | ${mib(uploadBytes)} MiB new | avg ${rate(uploadBytes, elapsedMs)} MiB/s`,
           `Active now: ↓${activeDownloads} download(s) / ↑${activeUploads} upload(s) | peak ↓${peakDownloads}`,
           ...perLane,
           'Note: speeds update when each segment completes.'
@@ -271,8 +300,8 @@
       async function transferLane(laneIndex) {
         const lane = laneInfo[laneIndex];
         while (!failure) {
-          const i = nextIndex++;
-          if (i >= segments.length) { lane.phase = 'done'; renderStats(); return; }
+          const i = pendingIndexes[nextIndex++];
+          if (i === undefined) { lane.phase = 'done'; renderStats(); return; }
           lane.index = i;
           lane.phase = 'downloading';
           activeDownloads++;
@@ -338,24 +367,37 @@
       if (failure) throw failure;
       await api(`/api/relay/${encodeURIComponent(job.job_id)}/finish`, key, {});
       transferFinished = true;
-      // /finish returns only when the server has accepted all segments.
-      // Conversion and Telegram delivery continue in the relay worker after
-      // the browser navigates away. The Telegram group gets live progress.
-      say(`✅ ${title}: all ${segments.length} segments safely uploaded. ` +
-          'MP4 conversion + Telegram sending is running in background. ' +
-          'You can open the NEXT lecture now; watch Telegram group for final delivery.');
-      console.info('[Lecture bridge] background job accepted:', job.job_id);
+      localStorage.removeItem(storageKey);
+      say(`✅ All ${segments.length} segments safely uploaded; Railway converting + sending to Telegram in background.`);
     } catch (e) {
-      // Free the server job slot on a failed browser upload.
-      // Never cancel once conversion or Telegram delivery has started.
+      // Keep completed TS segments on Railway, release upload slot, and let
+      // Queue Manager move to the next lecture. Never cancel a resumable job.
+      let alreadyAccepted = false;
       if (uploadJobId && !transferFinished) {
         try {
-          await api(`/api/relay/${encodeURIComponent(uploadJobId)}/cancel`, key, {});
-        } catch (cancelErr) {
-          console.warn('[Railway upload cleanup]', cancelErr);
+          const check = await fetch(`${RELAY}/api/relay/${encodeURIComponent(uploadJobId)}/status`,
+             {headers: key ? {'X-Relay-Key': key} : {}});
+          if (check.ok) {
+            const status = (await check.json()).status;
+            if (['processing','telegram_sending','sent'].includes(status)) alreadyAccepted = true;
+          }
+        } catch (_) {}
+        if (!alreadyAccepted) {
+          try {
+            await api(`/api/relay/${encodeURIComponent(uploadJobId)}/pause`, key, {});
+          } catch (pauseErr) {
+            console.warn('[Railway resumable pause]', pauseErr);
+            // If pause failed, server may still consider the upload in-flight;
+            // idle reap will pause it later. Do not claim it is saved yet.
+          }
         }
       }
-      say(`Failed: ${e.message || e}`);
+      if (alreadyAccepted) {
+        transferFinished = true;
+        say('✅ All segments safely uploaded; processing already started on Railway.');
+      } else {
+        say(`Failed: ${e.message || e} • Already accepted segments can be reused on Retry if Railway cache remains.`);
+      }
       console.error('[Railway MP4 link]', e);
     } finally {
       if (statsTimer !== null) clearInterval(statsTimer);

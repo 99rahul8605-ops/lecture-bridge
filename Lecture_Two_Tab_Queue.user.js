@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Two-Tab Queue Manager
 // @namespace    lecture-bridge-queue
-// @version      1.0.0
+// @version      1.1.0-resume
 // @description  Queue actual authorized lecture page URLs in a browsing tab. A separate worker tab runs the existing one-click Telegram uploader and shows queue stats. Does not alter media handling.
 // @match        https://vidcloud.eu.org/index.php*
 // @match        https://vidcloud.eu.org/play.php*
@@ -21,7 +21,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const STORAGE_KEY = 'lecture-two-tab-queue-v1';
   const LEASE_KEY = 'lecture-two-tab-queue-lease-v1';
   const TAB_KEY = 'lecture-two-tab-worker-id';
@@ -32,9 +32,11 @@
   const OPEN_TIMEOUT_MS = 2 * 60 * 1000;
   const CHECK_EVERY_MS = 1200;
   const BUSY_RETRY_MS = 45000;
-  const BUSY_MAX_MS = 3 * 60 * 60 * 1000;
+  const BUSY_MAX_MS = 12 * 60 * 1000;
+  const FAILURE_SETTLE_MS = 5000; // Do not trust an old/transient error while uploader is active
+  // program_id is optional on some genuine player URLs. Do not invent it or rewrite URLs.
   const REQUIRED_PARAMS = [
-    'batch_id', 'program_id', 'subject_id', 'topic_id', 'video_id',
+    'batch_id', 'subject_id', 'topic_id', 'video_id',
     'typeId', 'video_url', 'video_name', 'video_img', 'video_type', 'play_type'
   ];
 
@@ -117,6 +119,13 @@
   let workerNextAction = 0;
   let pendingNavigation = false;
   let initiatedUploadHere = false;
+  let failureSeenAt = 0;
+  let failureText = '';
+  function resetFailureObservation() {failureSeenAt = 0; failureText = '';}
+  function failedAndIdleFor(msg) {
+    if (failureText !== msg || !failureSeenAt) {failureText = msg; failureSeenAt = Date.now(); return false;}
+    return Date.now() - failureSeenAt >= FAILURE_SETTLE_MS;
+  }
   let lastLeaseWrite = 0;
   let workerStatus = 'Idle';
   const interruptedOnLoad = sessionStorage.getItem(ACTIVE_UPLOAD_TAB_KEY);
@@ -150,6 +159,8 @@
       <button type="button" data-action="start">▶ Start worker HERE</button>
       <button type="button" data-action="stop">⏸ Stop after current</button>
       <button type="button" data-action="clear">Clear finished</button>
+      <button type="button" data-action="clearAttention">Clear failed only</button>
+      <button type="button" data-action="retryFailed">↻ Retry failed</button>
       <button type="button" data-action="removeWaiting">Remove waiting</button>
     </div>
     <div class="ltq-counts"></div>
@@ -244,7 +255,7 @@
     s.workerId=localWorkerId; s.leaseUntil=now+LEASE_MS; s.run=true;lastLeaseWrite=now;
     GM_setValue(LEASE_KEY,{owner:localWorkerId,until:now+LEASE_MS});
     save(s);
-    toast('▶ Worker ON. Keep this tab open; add lectures from a SECOND tab.');
+    toast('▶ Worker ON • 🔇 Auto-Mute/Pause armed. Keep this tab open; add lectures from a SECOND tab.');
     setTimeout(tickWorker,100);
   }
   function stopWorker() {
@@ -254,6 +265,30 @@
   function clearFinished() {
     mutate(s=>{s.items=s.items.filter(x=>!['relay_accepted','telegram_sent'].includes(x.status));return s;});
     toast('Completed queue entries cleared.');
+  }
+  function clearAttention() {
+    if(!confirm('Remove only failed/interrupted/expired queue entries? First verify whether their upload actually reached Telegram. Waiting lectures will stay.'))return;
+    mutate(s=>{s.items=s.items.filter(x=>!['failed','expired','interrupted'].includes(x.status));return s;});
+    toast('Failed/interrupted/expired entries cleared; waiting lectures preserved.');
+  }
+  function retryFailed() {
+    let retried = 0, expired = 0;
+    mutate(s => {
+      if (s.activeId) { return s; }
+      for (const item of s.items) {
+        if (!['failed','interrupted','expired'].includes(item.status)) continue;
+        if (!item.url || Date.now() - item.addedAt > URL_TTL_MS) {
+          item.status = 'expired';
+          item.message = 'Open lecture via real chapter card, then Add this lecture again.';
+          expired++;
+          continue;
+        }
+        item.status = 'queued'; item.startedAt = 0; item.busySince = 0;
+        item.message = ''; retried++;
+      }
+      return s;
+    });
+    toast(`♻ Requeued ${retried} failed lecture(s). ${expired} expired URL(s) need re-adding from chapter cards.`);
   }
   function removeWaiting() {
     if(!confirm('Remove all waiting/failed/expired lectures? The active upload is not affected.'))return;
@@ -267,8 +302,48 @@
     else if(action==='start')startWorker();
     else if(action==='stop')stopWorker();
     else if(action==='clear')clearFinished();
+    else if(action==='clearAttention')clearAttention();
+    else if(action==='retryFailed')retryFailed();
     else if(action==='removeWaiting')removeWaiting();
   });
+
+  // Worker-only playback control. Let the genuine player discover its authorized
+  // playlist first; then silence/pause playback while the separate uploader runs.
+  // This does NOT pause the Chrome -> relay transfer or block media requests.
+  function silenceWorkerPlayer() {
+    if (!localWorkerId) return;
+    const s = load();
+    if (!ownLease(s) || !s.run) return; // never alter the BROWSE tab
+    const item = s.items.find(x => x.id === s.activeId);
+    // Do not pause before playlist discovery: some players only request the
+    // manifest after Play. Mute is safe even before the manifest is available.
+    const safeToPause = Boolean(item && ['opening', 'uploading'].includes(item.status)
+      && (playlistObserved() || (item.status === 'uploading' && senderElements()?.btn.disabled)));
+    const documents = [document];
+    if (typeof document.querySelectorAll === 'function') {
+      for (const frame of document.querySelectorAll('iframe')) {
+        try { if (frame.contentDocument) documents.push(frame.contentDocument); }
+        catch (_) { /* cross-origin iframe: browser disallows access */ }
+      }
+    }
+    for (const doc of documents) {
+      if (typeof doc.querySelectorAll !== 'function') continue;
+      for (const media of doc.querySelectorAll('video, audio')) {
+        try {
+          media.muted = true;
+          media.defaultMuted = true;
+          if (safeToPause && !media.paused && typeof media.pause === 'function') {
+            media.pause();
+          }
+        } catch (_) { /* inaccessible/replaced player; try again next tick */ }
+      }
+    }
+  }
+  // Also guard replays between scheduled checks, including dynamically loaded video.
+  if (typeof document.addEventListener === 'function') {
+    document.addEventListener('play', () => silenceWorkerPlayer(), true);
+  }
+  setInterval(silenceWorkerPlayer, 700);
 
   function senderElements() {
     const root=document.getElementById('railway-lecture-link-v1');
@@ -304,19 +379,23 @@
     initiatedUploadHere=false;
     currentWorkStart=0;
     workerNextAction=0;
+    resetFailureObservation();
     const updated=QueueCore.complete(s,videoId,status);
     save(updated);
     toast(status==='telegram_sent'?'✅ Telegram sent; advancing':'✅ VPS accepted; Telegram sending may continue in background. Advancing.');
   }
   function failCurrent(s,videoId,message) {
+    resetFailureObservation();
     sessionStorage.removeItem(ACTIVE_UPLOAD_TAB_KEY);
     initiatedUploadHere=false;
     const item=s.items.find(x=>x.id===videoId);
     if(item){item.status='failed';item.message=message;}
     if(s.activeId===videoId)s.activeId=null;
-    s.run=false;
+    // Don't block remaining lectures after a real final failure.
+    // Keep URL + title for explicit Retry failed after current queue runs.
+    // Frontend is confirmed idle before this function is called.
     save(s);
-    toast(`⚠️ Upload failed; worker paused: ${message.slice(0,110)}`);
+    toast(`⏭ Skipped failed lecture; next queued lecture will start. ${message.slice(0,100)}`);
   }
 
   function tickWorker() {
@@ -341,6 +420,12 @@
     }
     if(!s.activeId) {
       if(!s.run) return;
+      // A manual/previous upload may still own this tab. Never navigate away from it.
+      const sender = senderElements();
+      if(sender && sender.btn.disabled) {
+        workerStatus='⏳ Existing browser upload still running; will start queue after it finishes';
+        return;
+      }
       const picked=QueueCore.next(s,Date.now());
       save(picked.state);
       if(!picked.item) {workerStatus='✅ Queue empty; waiting for new lectures';return;}
@@ -352,6 +437,11 @@
     if(item.status==='opening') {
       if(!s.run) return; // paused before starting upload
       if(location.pathname!=='/play.php'||new URLSearchParams(location.search).get('video_id')!==item.id) {
+        const existingSender=senderElements();
+        if(existingSender && existingSender.btn.disabled) {
+          workerStatus='⏳ Existing browser upload is busy; not navigating away';
+          return;
+        }
         if(pendingNavigation)return;
         if(!item.url) {failCurrent(s,item.id,'Missing player URL; re-add from website card.');return;}
         try {
@@ -392,6 +482,20 @@
         finishCurrent(s,item.id,'relay_accepted');return;
       }
       if(/^Failed:/i.test(msg)) {
+        // The uploader may be cleaning up an old request, or have started a fresh
+        // attempt while the last error is still displayed. Its disabled button is
+        // the strongest existing signal that network work is actually in progress.
+        if(sender.btn.disabled) {
+          resetFailureObservation();
+          workerStatus=`⏳ Uploader is still working; ignoring temporary error text`;
+          return;
+        }
+        // Require the SAME final error to remain with an idle sender for 5 sec.
+        // Otherwise a stale failure can incorrectly stop a successful upload.
+        if(!failedAndIdleFor(msg)) {
+          workerStatus='⏳ Confirming uploader is idle after error (5s)…';
+          return;
+        }
         if(/\b429\b/.test(msg)) {
           if(!item.busySince)item.busySince=Date.now();
           if(Date.now()-item.busySince>BUSY_MAX_MS) {
@@ -402,12 +506,14 @@
           save(s);
           if(Date.now()>=workerNextAction&&sender.btn&&!sender.btn.disabled&&s.run) {
             workerNextAction=0;
+            resetFailureObservation();
             sender.btn.click();
           }
           return;
         }
         failCurrent(s,item.id,msg);return;
       }
+      resetFailureObservation();
       workerStatus=`⬆ ${item.title.slice(0,48)} — ${msg.slice(0,100)||'Starting…'}`;
     }
     render();
@@ -417,5 +523,5 @@
     if(localWorkerId && s.workerId===localWorkerId) tickWorker();
     render();
   },CHECK_EVERY_MS);
-  console.info('[Lecture queue] Two-tab queue ready; existing uploader unchanged.');
+  console.info('[Lecture queue] Worker-only auto-mute/pause ready; existing uploader unchanged.');
 })();

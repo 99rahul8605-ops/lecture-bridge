@@ -1,0 +1,34 @@
+const fs=require('fs');
+const assert=require('assert').strict;
+const vm=require('vm');
+const path=require('path');
+const src=fs.readFileSync(path.join(__dirname,'Lecture_Two_Tab_Queue.user.js'),'utf8');
+const core=src.split('// BEGIN QUEUE CORE')[1].split('// END QUEUE CORE')[0];
+const required=['batch_id','subject_id','topic_id','video_id','typeId','video_url','video_name','video_img','video_type','play_type'];
+const lib=vm.runInNewContext(`(function(){ const REQUIRED_PARAMS=${JSON.stringify(required)}; const MAX_QUEUE=60; const URL_TTL_MS=12*60*60*1000; ${core}; return QueueCore; })()`, {URL});
+const player=(n)=>{
+  const u=new URL('https://vidcloud.eu.org/play.php');
+  for(const k of required)u.searchParams.set(k,k==='video_id'?`video${n}`:k==='video_name'?`Lecture ${n}`:`value${n}`);
+  return u.href;
+};
+let pass=0;
+function test(name,f){try{f();console.log('PASS',name);pass++}catch(e){console.error('FAIL',name,e);process.exitCode=1}}
+const now=Date.now();
+test('accept 10-param real player URLs without program_id',()=>assert.equal(lib.identity(player(1)).id,'video1'));
+test('accept original URL with program_id when supplied',()=>{const u=new URL(player(1));u.searchParams.set('program_id','as-supplied');assert.equal(lib.identity(u.href).url,u.href)});
+test('does not invent program_id',()=>assert.equal(new URL(lib.identity(player(1)).url).searchParams.has('program_id'),false));
+test('still rejects genuinely missing required video_url',()=>{const u=new URL(player(1));u.searchParams.delete('video_url');assert.throws(()=>lib.identity(u.href),/incomplete/)});
+test('reject incomplete five-param URL',()=>assert.throws(()=>lib.identity('https://vidcloud.eu.org/play.php?batch_id=abc&video_id=1'),/incomplete/));
+test('reject different website',()=>assert.throws(()=>lib.identity('https://example.com/play.php?video_id=1'),/Open a lecture/));
+test('deduplicates same video',()=>{let s=lib.add(lib.empty(),player(1),now).state;const r=lib.add(s,player(1),now+1);assert.equal(r.inserted,false);assert.equal(r.state.items.length,1)});
+test('FIFO next queued video',()=>{let s=lib.add(lib.empty(),player(1),now).state;s=lib.add(s,player(2),now).state;const r=lib.next(s,now+1);assert.equal(r.item.id,'video1');assert.equal(r.state.activeId,'video1')});
+test('does not pick another while active',()=>{let s=lib.add(lib.empty(),player(1),now).state;s=lib.next(s,now).state;assert.equal(lib.next(s,now+1).item,null)});
+test('completed bridge job frees active slot and deletes sensitive URL',()=>{let s=lib.add(lib.empty(),player(1),now).state;s=lib.next(s,now).state;s=lib.complete(s,'video1','relay_accepted');assert.equal(s.items[0].url,'');assert.equal(s.activeId,null);assert.equal(lib.counts(s).server,1)});
+test('distinguishes Telegram sent from bridge accepted',()=>{let s=lib.add(lib.empty(),player(1),now).state;s=lib.next(s,now).state;s=lib.complete(s,'video1','telegram_sent');assert.equal(lib.counts(s).sent,1);assert.equal(lib.counts(s).server,0)});
+test('expired URL not auto-navigated',()=>{let s=lib.add(lib.empty(),player(1),now-13*60*60*1000).state;const r=lib.next(s,now);assert.equal(r.item,null);assert.equal(r.state.items[0].status,'expired')});
+test('expired lecture refreshed by real card URL',()=>{let s=lib.add(lib.empty(),player(1),now-13*60*60*1000).state;s=lib.next(s,now).state;const r=lib.add(s,player(1),now);assert.equal(r.inserted,true);assert.equal(r.state.items[0].status,'queued')});
+test('keeps original order when completing video one',()=>{let s=lib.add(lib.empty(),player(1),now).state;s=lib.add(s,player(2),now).state;s=lib.next(s,now).state;s=lib.complete(s,'video1','telegram_sent');assert.equal(lib.next(s,now+1).item.id,'video2')});
+test('queue capped',()=>{let s=lib.empty();for(let i=0;i<60;i++)s=lib.add(s,player(i),now).state;assert.throws(()=>lib.add(s,player(61),now),/limit/)});
+test('no media/network handling in queue addon',()=>{assert.equal(/fetch\(|\.send_file\(|\.send_video\(/.test(src),false)});
+test('exposes queue stats and controls',()=>{for(const x of ['Waiting','VPS accepted','TG sent','Start worker HERE','+ Add this lecture'])assert.ok(src.includes(x))});
+console.log(`${pass} queue tests passed`);
