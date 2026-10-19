@@ -1,45 +1,40 @@
-# 2/3 Parallel Segment Upload Test — Ubuntu VPS
+# One-click Telegram Uploader — Download + Upload Lane Statistics v2.5
 
-Existing **one-click Send MP4 to Telegram** uploader ka speed test. No automatic batch selection, no new Telegram bot. Website player normal tarike se kholo. This is only for media you are authorized to export, and the script still refuses encrypted HLS/fMP4 unsupported streams.
-
-## Files
-
-- `relay_api.py`: same existing conversion + group progress, but accepts up to 3 out-of-order segment uploads; MPEG-TS assembled **original segment index 0,1,2...** using a bounded memory/disk buffer.
-- `Railway_Auto_Telegram.user.js`: `https://upload.bingolink.site` preset, dropdown with **1 / 2 / 3 upload lanes** (default **2**); old one-click button preserved.
-- `enable_parallel.sh`: configures VPS to allow 3 concurrent segment requests and restarts only port 8090's Gunicorn master (loads new .env). No other bots or Cloudflare Tunnel changes.
-- `test_parallel_server.py` and `test_parallel_browser.cjs`: offline tests.
+Ye **sirf browser Tampermonkey UI update** hai. Ubuntu VPS ka `relay_api.py`, `.env`, Gunicorn, Cloudflare Tunnel aur Telegram sending unchanged rahenge.
 
 ## Install
 
-1. Stop/wait for any **ongoing video upload or Telegram send**. In the GitHub `lecture-bridge` repository, replace `relay_api.py`, `Railway_Auto_Telegram.user.js` and add `enable_parallel.sh`, `test_parallel_server.py` and (optionally) `test_parallel_browser.cjs`.
-2. In Ubuntu VPS terminal:
+1. Chrome Tampermonkey -> **Lecture Auto Send to Telegram** -> Edit.
+2. Is package ki `Railway_Auto_Telegram.user.js` file se existing script **poora replace** karo, Ctrl+S save karo.
+3. Duplicate `Lecture Auto Send to Telegram` copies disable karo.
+4. `vidcloud.eu.org/play.php` player reload karo.
+5. 1, 2, ya 3 upload lanes select karo aur **Send MP4 to Telegram** button dabao.
+6. Stats panel button ke neeche dikhega.
 
-```bash
-cd ~/lecture-bridge
-git pull --ff-only
-bash enable_parallel.sh
-curl -sS https://upload.bingolink.site/health
-```
+## Stats panel
 
-3. In Chrome Tampermonkey replace the **existing one-click uploader** with the new `Railway_Auto_Telegram.user.js`. Keep other auto-catalog worker scripts disabled. Refresh existing lecture player.
-4. Test with **1 lane first**, then same video with **2 lanes** (when no existing transfer running), optionally 3. Compare the actual Chrome→VPS `MiB/s` and Telegram delivery. Default 2 lanes isn't guaranteed faster than 1.
+- `CDN download: X/N` — kitne segment fetch aur ArrayBuffer mein receive ho chuke hain.
+- `VPS upload: X/N` — kitne segment VPS ne HTTP success ke saath receive kiye.
+- `MiB` — un complete segments ka total size.
+- `avg MiB/s` — job start se ab tak elapsed wall-time par based average *completed bytes throughput*. Ye current network link ki instant speed nahi hai.
+- `Active now: ↓D / ↑U` — kitni fetch / POST requests filhaal in progress hain.
+- `peak ↓P` — ek samay mein sabse zyada concurrent download requests.
+- `L1`, `L2`, `L3` — lane status, current segment number, most recent finished segment ke download aur upload transfer rates.
 
-## Safety & performance
+**Stats segment complete hone ke baad update hoti hain.** Existing browser fetch `arrayBuffer()` method download progress byte-by-byte expose nahi karta; live byte-counting enable karne ke liye alag streaming-reader changes chahiye jo yahan intentionally nahi kiye.
 
-- Keep `--workers 1 --threads 16`, `RELAY_MAX_JOBS=1`; `RELAY_PARALLEL_UPLOADS=3` only controls **segment POST concurrency**, not concurrent video jobs.
-- Each segment is saved by index and only its contiguous playlist prefix is appended; no mix-up if segment 2 arrives before segment 0.
-- `finish` returns `409` until all segments are present. A failed upload cancels the job. Original MP4 conversion, thumbnail, Telethon and Telegram progress paths unchanged.
-- A video above your current `.env` `RELAY_MAX_GB=0.7` will still be rejected; that limit is unchanged.
-- Cloudflare Tunnel can still be bottleneck; concurrency is a speed experiment, not a promised 2x/3x throughput.
-- No-key mode (`RELAY_REQUIRE_UPLOAD_KEY=0`) exposes a public upload surface; switch to upload-key auth when possible. This package does not change authorization settings.
-- Existing active jobs are in Gunicorn memory; **never reload while an upload or Telegram delivery is in progress**.
+## Important
 
-## Roll back if 2/3 slower
+- Script ka server base `https://upload.bingolink.site` hai. Agar tumhara URL alag hai, top par `let RELAY = ...` apne HTTPS bridge endpoint se badalna.
+- API path, HLS parsing, segment indexing, finalization, MP4 conversion aur Telegram delivery behavior untouched.
+- 2/3 lanes **faster hone ki guarantee nahi**. A/B speed compare karo.
+- Existing security, encryption, authorized-access checks intact hain; no license / DRM bypass.
+- **Koi GitHub pull, Railway/VPS restart, Python file replacement zaroori nahi** (jab tak VPS pe compatible parallel-lane relay API pehle se installed hai).
 
-Select **`1 upload lane`** in the Tampermonkey dropdown. No VPS restart needed; the new server accepts 1-lane sequential requests too. To fully revert, restore the previous Git commit of these two files in the repository and reload Gunicorn outside an active transfer.
+## Offline verification
 
-## Verified locally
-
-- Node `--check`, Python `py_compile`.
-- Tests: 1/2/3/6 segment reverse-order server assembly, duplicate/index/missing guards, conversion gated; browser mock for 1/2/3 parallel lanes and error cancellation.
-- **NOT** verified against live VPS, CDN, Telegram network. Final speed and complete Telegram MP4 need user-side test.
+- `node --check Railway_Auto_Telegram.user.js`
+- `node test_stats_mock.cjs`
+- 1/2/3 lane mock transfers: concurrent fetches and POSTs, correct original segment indexes, successful finish.
+- Failure case: relay job cancelled and no finalize.
+- Not tested end-to-end against your live browser/CDN/VPS/Telegram.

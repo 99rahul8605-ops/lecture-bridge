@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.4.0
+// @version      2.5.0
 // @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
@@ -36,6 +36,11 @@
       max-width:370px!important; }
     #${WIDGET_ID} select { font:13px system-ui!important; border-radius:7px!important;
       padding:6px 10px!important; color:#111!important; background:#fff!important; }
+    #${WIDGET_ID} .relay-stats { background:#0c2337!important;color:#d7f5ff!important;
+      border-radius:8px!important;padding:10px 12px!important;box-shadow:0 3px 12px #0007!important;
+      font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace!important;
+      white-space:pre-line!important;text-align:left!important;max-width:min(420px,94vw)!important;
+      font-variant-numeric:tabular-nums!important;overflow-wrap:anywhere!important; }
   `;
 
   const root = document.createElement('div');
@@ -54,7 +59,10 @@
   const status = document.createElement('div');
   status.className = 'relay-message';
   status.hidden = true;
-  root.append(lanes, button, status);
+  const stats = document.createElement('div');
+  stats.className = 'relay-stats';
+  stats.hidden = true;
+  root.append(lanes, button, status, stats);
   (document.head || document.documentElement).appendChild(css);
   document.body.appendChild(root);
 
@@ -153,6 +161,9 @@
     lanes.disabled = true;
     let uploadJobId = null;
     let transferFinished = false;
+    let statsTimer = null;
+    stats.hidden = true;
+    stats.textContent = '';
     try {
       say('Finding authorized HLS playlist…');
       const {url, body} = await findManifest();
@@ -167,37 +178,93 @@
       const CONCURRENCY = Math.max(1, Math.min(3, Number(lanes.value) || 2));
       const began = performance.now();
       let nextIndex = 0;
-      let completed = 0;
-      let bytes = 0;
+      let downloaded = 0, uploaded = 0;
+      let downloadBytes = 0, uploadBytes = 0;
+      let activeDownloads = 0, activeUploads = 0, peakDownloads = 0;
       let failure = null;
+      const laneInfo = Array.from({length: CONCURRENCY}, () => ({phase: 'idle', index: -1, downloadRate: null, uploadRate: null}));
+      const mib = bytes => (bytes / 1048576).toFixed(1);
+      const rate = (bytes, ms) => (bytes / 1048576 / Math.max(ms / 1000, 0.001)).toFixed(2);
+      // These are averages over elapsed wall time; network bytes still in flight
+      // cannot be measured with fetch().arrayBuffer() until a segment finishes.
+      function renderStats() {
+        const elapsedMs = Math.max(performance.now() - began, 1000);
+        const perLane = laneInfo.map((lane, laneIndex) => {
+          const current = lane.index < 0 ? '' : ` #${lane.index + 1}`;
+          const lastDL = lane.downloadRate == null ? '—' : `${lane.downloadRate} MiB/s`;
+          const lastUL = lane.uploadRate == null ? '—' : `${lane.uploadRate} MiB/s`;
+          return `L${laneIndex + 1} ${lane.phase}${current} | last ↓${lastDL} ↑${lastUL}`;
+        });
+        stats.textContent = [
+          `⬇ CDN download: ${downloaded}/${segments.length} | ${mib(downloadBytes)} MiB | avg ${rate(downloadBytes, elapsedMs)} MiB/s`,
+          `⬆ VPS upload:   ${uploaded}/${segments.length} | ${mib(uploadBytes)} MiB | avg ${rate(uploadBytes, elapsedMs)} MiB/s`,
+          `Active now: ↓${activeDownloads} download(s) / ↑${activeUploads} upload(s) | peak ↓${peakDownloads}`,
+          ...perLane,
+          'Note: speeds update when each segment completes.'
+        ].join('\n');
+      }
+      stats.hidden = false;
+      renderStats();
+      // Update the active-lane indicator even if a segment takes several seconds.
+      statsTimer = setInterval(renderStats, 800);
       say(`${CONCURRENCY} upload lane(s) running • ${segments.length} segments`);
-      async function transferLane() {
+      async function transferLane(laneIndex) {
+        const lane = laneInfo[laneIndex];
         while (!failure) {
           const i = nextIndex++;
-          if (i >= segments.length) return;
+          if (i >= segments.length) { lane.phase = 'done'; renderStats(); return; }
+          lane.index = i;
+          lane.phase = 'downloading';
+          activeDownloads++;
+          peakDownloads = Math.max(peakDownloads, activeDownloads);
+          renderStats();
+          let data;
+          const downloadBegan = performance.now();
           try {
-            const response = await fetch(segments[i], {mode: 'cors', credentials: 'same-origin'});
-            if (!response.ok) throw new Error(`Video segment ${i + 1} HTTP ${response.status}`);
-            const data = await response.arrayBuffer();
-            if (i === 0) {
-              const x = new Uint8Array(data);
-              if (x.length < 189 || x[0] !== 0x47 || x[188] !== 0x47)
-                throw new Error('Not MPEG-TS segments; encrypted/fMP4 formats unsupported');
+            try {
+              const response = await fetch(segments[i], {mode: 'cors', credentials: 'same-origin'});
+              if (!response.ok) throw new Error(`Video segment ${i + 1} HTTP ${response.status}`);
+              data = await response.arrayBuffer();
+              if (i === 0) {
+                const x = new Uint8Array(data);
+                if (x.length < 189 || x[0] !== 0x47 || x[188] !== 0x47)
+                  throw new Error('Not MPEG-TS segments; encrypted/fMP4 formats unsupported');
+              }
+              downloaded++;
+              downloadBytes += data.byteLength;
+              lane.downloadRate = rate(data.byteLength, performance.now() - downloadBegan);
+            } finally {
+              activeDownloads--;
+              renderStats();
             }
-            await api(`/api/relay/${encodeURIComponent(job.job_id)}/segment/${i}`, key, data);
-            completed++;
-            bytes += data.byteLength;
-            const secs = Math.max((performance.now() - began) / 1000, 1);
-            const rate = (bytes / 1048576 / secs).toFixed(2);
-            say(`${CONCURRENCY} lanes • Upload ${completed}/${segments.length} • ${(bytes/1048576).toFixed(1)} MiB • ${rate} MiB/s. Keep tab open.`);
+            lane.phase = 'uploading';
+            activeUploads++;
+            renderStats();
+            const uploadBegan = performance.now();
+            try {
+              await api(`/api/relay/${encodeURIComponent(job.job_id)}/segment/${i}`, key, data);
+              uploaded++;
+              uploadBytes += data.byteLength;
+              lane.uploadRate = rate(data.byteLength, performance.now() - uploadBegan);
+            } finally {
+              activeUploads--;
+              renderStats();
+            }
+            lane.phase = 'saved';
+            renderStats();
+            say(`${CONCURRENCY} lanes • Uploaded ${uploaded}/${segments.length} • ${mib(uploadBytes)} MiB. Download/upload stats below.`);
           } catch (error) {
+            lane.phase = 'failed';
+            renderStats();
             failure ||= error;
             return;
           }
         }
       }
       // Wait for all current transfers to settle before finish or cancel.
-      await Promise.all(Array.from({length: Math.min(CONCURRENCY, segments.length)}, transferLane));
+      await Promise.all(Array.from({length: Math.min(CONCURRENCY, segments.length)}, (_, i) => transferLane(i)));
+      if (statsTimer !== null) { clearInterval(statsTimer); statsTimer = null; }
+      renderStats();
       if (failure) throw failure;
       await api(`/api/relay/${encodeURIComponent(job.job_id)}/finish`, key, {});
       transferFinished = true;
@@ -217,6 +284,7 @@
       say(`Failed: ${e.message || e}`);
       console.error('[Railway MP4 link]', e);
     } finally {
+      if (statsTimer !== null) clearInterval(statsTimer);
       button.disabled = false;
       lanes.disabled = false;
     }
