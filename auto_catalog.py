@@ -396,8 +396,16 @@ def _browser_id(value):
 
 
 def _assigned_lecture(db, video_id):
-    r = db.execute('SELECT batch_id,subject_id,chapter_id,video_id,title FROM lectures WHERE video_id=?',
-                   (video_id,)).fetchone()
+    r = db.execute('''SELECT l.batch_id,l.subject_id,l.chapter_id,l.video_id,l.title,
+                          COALESCE(b.name,'') AS batch_name,
+                          COALESCE(s.name,'') AS subject_name,
+                          COALESCE(c.name,'') AS chapter_name
+                     FROM lectures AS l
+                     LEFT JOIN batches AS b ON b.id=l.batch_id
+                     LEFT JOIN subjects AS s ON s.batch_id=l.batch_id AND s.id=l.subject_id
+                     LEFT JOIN chapters AS c ON c.batch_id=l.batch_id
+                          AND c.subject_id=l.subject_id AND c.id=l.chapter_id
+                     WHERE l.video_id=?''', (video_id,)).fetchone()
     if not r:return None
     return dict(r)
 
@@ -418,7 +426,12 @@ def worker_next(browser_id):
             if state and state['status']=='awaiting_export':
                 if active['browser_id']==browser_id:
                     details=_assigned_lecture(db,active['video_id'])
-                    if details:return {'state':'assigned','lecture':details}
+                    if details:
+                        # Renew the lease during slow, native website navigation.
+                        # No duplicate assignment or extra attempt is created.
+                        db.execute('UPDATE worker_active SET lease_until=? WHERE uid=?',
+                                   (now+_WORKER_LEASE_SECONDS,uid))
+                        return {'state':'assigned','lecture':details}
                 return {'state':'busy'}
         if active:
             db.execute('DELETE FROM worker_active WHERE uid=?',(uid,))

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VidCloud Auto Catalog Sync (metadata only)
 // @namespace    lecture-bridge/catalog
-// @version      2.0.0
-// @description  Auto open queued lecture pages and trigger existing permitted uploader; success-confirmed delivery only, no DRM changes.
+// @version      2.1.0
+// @description  Queue navigator follows the site's own batch/subject/chapter cards (no guessed player security fields). Existing authorised uploader unchanged.
 // @match        https://vidcloud.eu.org/*
 // @run-at       document-start
 // @grant        unsafeWindow
@@ -327,14 +327,110 @@
       });
     });
   }
-  function targetUrl(job) {
-    const u=new URL('/play.php',location.origin);
-    u.searchParams.set('batch_id',job.batch_id);
-    u.searchParams.set('subject_id',job.subject_id);
-    u.searchParams.set('topic_id',job.chapter_id);
-    u.searchParams.set('video_id',job.video_id);
-    u.searchParams.set('video_name',job.title);
-    return u.toString();
+  // A player opened from the site's own lecture card contains fields established
+  // by the site (11 observed). Never guess, forge, replay, or collect security URLs.
+  // Native card.click() lets the website perform its own access checks.
+  const PLAYER_FIELDS = ['batch_id','program_id','subject_id','topic_id',
+    'video_id','typeId','video_url','video_name','video_img','video_type','play_type'];
+  let lastNavStep = '';
+  let lastNavAt = 0;
+  let searchStartedAt = 0;
+  let nextTickDelay = 10000;
+  const visible = el => !!el && el.getClientRects().length > 0 &&
+    getComputedStyle(el).visibility !== 'hidden';
+  const elementFor = (selector, attr, id, test = () => true) =>
+    [...document.querySelectorAll(selector)].find(el => visible(el) &&
+      el.getAttribute(attr) === id && test(el));
+
+  function clickNative(el, action, job) {
+    if (!el) return false;
+    const step = job.video_id + '|' + action;
+    if (lastNavStep === step && Date.now() - lastNavAt < 5000) {
+      nextTickDelay = 1700;
+      return true;
+    }
+    lastNavStep = step;
+    lastNavAt = Date.now();
+    workerStatus(action + ': ' + job.title.slice(0,34));
+    nextTickDelay = 1700;
+    el.click(); // invokes the website's real handler; no direct player URL
+    return true;
+  }
+
+  function searchBatch(job) {
+    // The site search UI can asynchronously render batch cards. We use its
+    // regular input event, not undocumented API requests or auth headers.
+    const input = document.querySelector('#globalSearchInput');
+    const batchName = String(job.batch_name || '')
+      .replace(/\s+NEW\b.*$/i,'').replace(/\s+Class\s+\d.*$/i,'').trim();
+    if (!input || !batchName || /^Unlabelled batch /i.test(batchName)) return false;
+    const modal = document.querySelector('#globalSearchModal');
+    if (modal && !modal.classList.contains('active')) {
+      const opener = [...document.querySelectorAll('button,[role="button"]')]
+        .find(b => visible(b) && /search/i.test(
+          (b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '') + ' ' + (b.id || '')));
+      if (opener) return clickNative(opener,'Open website batch search',job);
+      // Some site layouts keep the search input active without a separate button.
+      if (!visible(input)) return false;
+    }
+    if (input.value !== batchName && Date.now() - searchStartedAt > 4000) {
+      searchStartedAt = Date.now();
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype, 'value')?.set;
+      if (setter) setter.call(input,batchName);
+      else input.value = batchName;
+      input.dispatchEvent(new Event('input',{bubbles:true}));
+      workerStatus('Searching batch on website: ' + batchName.slice(0,50));
+      nextTickDelay = 1800;
+      return true;
+    }
+    return false;
+  }
+
+  function navigateByWebsite(job) {
+    if (location.pathname !== '/index.php' && location.pathname !== '/') {
+      if (location.pathname.startsWith('/verify-task/')) {
+        sessionStorage.removeItem(RUN_FLAG);
+        workerStatus('Website verification required; complete it manually, then resume');
+        return true;
+      }
+      workerStatus('Returning to normal website course navigation');
+      location.assign(new URL('/index.php',location.origin).href);
+      return true;
+    }
+    // Start at the deepest currently visible course level, then walk backwards
+    // through website UI. The lecture card alone can generate the valid URL.
+    const video = elementFor('[data-video-id]','data-video-id',job.video_id);
+    if (video) return clickNative(video,'Clicking authorised lecture card',job);
+
+    const ch = elementFor('[data-topic-id],[data-chapter-id],[data-id]',
+      'data-topic-id',job.chapter_id) ||
+      elementFor('[data-topic-id],[data-chapter-id],[data-id]',
+      'data-chapter-id',job.chapter_id) ||
+      elementFor('[data-topic-id],[data-chapter-id],[data-id]',
+      'data-id',job.chapter_id,
+        e => /\d+\s*lectures?/i.test(e.innerText || ''));
+    if (ch) return clickNative(ch,'Opening chapter via website',job);
+
+    const subject = elementFor('[data-subject-id],[data-id]',
+      'data-subject-id',job.subject_id) ||
+      elementFor('[data-subject-id],[data-id]',
+      'data-id',job.subject_id,
+        e => /\d+\s*chapters?/i.test(e.innerText || ''));
+    if (subject) return clickNative(subject,'Opening subject via website',job);
+
+    const batch = elementFor('[data-batch-id]','data-batch-id',job.batch_id);
+    if (batch) return clickNative(batch,'Opening batch via website',job);
+
+    if (searchBatch(job)) return true;
+    workerStatus('Waiting for normal website batch/subject UI; open batch search if needed');
+    nextTickDelay = 3000;
+    return false;
+  }
+
+  function hasWebsitePlayerContext() {
+    const p = new URLSearchParams(location.search);
+    return PLAYER_FIELDS.every(k => p.has(k));
   }
   function hasHlsManifest() {
     return performance.getEntriesByType('resource').some(r=> {
@@ -350,7 +446,14 @@
       throw new Error('Worker finish not acknowledged: '+result.state);
     workerStatus(`${status}: ${job.title.slice(0,35)}. Next...`);
     await pause(1800);
-    location.assign(new URL('/index.php',location.origin).href);
+    // Prefer browser Back: normal website navigation may restore the already-open
+    // chapter, which keeps subsequent lecture-card clicks fast.
+    if (document.referrer && new URL(document.referrer).origin===location.origin &&
+        new URL(document.referrer).pathname==='/index.php' && history.length>1) {
+      history.back();
+    } else {
+      location.assign(new URL('/index.php',location.origin).href);
+    }
   }
   async function performJob(job) {
     let heartbeat;
@@ -445,9 +548,10 @@
         if(!validJob(job)) throw new Error('Bad lecture metadata');
         const onCorrectPlayer=location.pathname==='/play.php' &&
           new URLSearchParams(location.search).get('video_id')===job.video_id;
-        if(!onCorrectPlayer) {
-          workerStatus('Navigating to '+job.title.slice(0,42));
-          location.assign(targetUrl(job));
+        if (!onCorrectPlayer || !hasWebsitePlayerContext()) {
+          // Crucial: incomplete 5-parameter URLs trigger "Security fields missing".
+          // Never fabricate the remaining fields; navigate via the site's cards.
+          navigateByWebsite(job);
           return;
         }
         await performJob(job);
@@ -461,9 +565,18 @@
       console.warn('[AutoCatalogWorker]',err);
     } finally {
       workerBusy=false;
-      if(running()) workerTimer=setTimeout(workerTick,10000);
+      if(running()) {
+        workerTimer=setTimeout(workerTick,nextTickDelay);
+        nextTickDelay=10000;
+      }
     }
   }
+  window.addEventListener('pageshow',e=> {
+    if (e.persisted && running()) {
+      clearTimeout(workerTimer);
+      workerTimer=setTimeout(workerTick,1500);
+    }
+  });
   GM_registerMenuCommand('▶ Start Telegram queue worker IN THIS TAB',()=>{
     if(GM_getValue(keyId,'').length<24) {
       alert('First Configure catalog sync key in Tampermonkey.');return;
