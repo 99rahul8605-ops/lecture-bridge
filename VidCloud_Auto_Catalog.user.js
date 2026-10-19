@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VidCloud Auto Catalog Sync (metadata only)
 // @namespace    lecture-bridge/catalog
-// @version      2.2.0
-// @description  Queue navigator follows the site's own batch/subject/chapter cards (no guessed player security fields). Existing authorised uploader unchanged.
+// @version      2.3.0
+// @description  Fix chapter-card navigation and stale global-search modal. Existing permitted uploader unchanged.
 // @match        https://vidcloud.eu.org/*
 // @run-at       document-start
 // @grant        unsafeWindow
@@ -15,6 +15,7 @@
 (() => {
   'use strict';
   const BRIDGE = 'https://ubuntu-production-9d09.up.railway.app';
+  const VERSION = '2.3.0';
   const w = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const STORAGE = 'vc_auto_catalog_ctx';
   const keyId = 'catalogSyncKey';
@@ -41,7 +42,7 @@
     alert('Catalog key saved. Reload website and browse your batch/chapter pages.');
   });
   GM_registerMenuCommand('Show auto-catalog status', () => {
-    alert('Catalog sync key: ' + (GM_getValue(keyId, '').length >= 24 ? 'configured' : 'NOT configured') +
+    alert('Auto Catalog v' + VERSION + '\nCatalog sync key: ' + (GM_getValue(keyId, '').length >= 24 ? 'configured' : 'NOT configured') +
       '\nSelected context: ' + JSON.stringify(context));
   });
 
@@ -328,7 +329,7 @@
         'max-width:330px;font:12px system-ui;box-shadow:0 2px 12px #0006';
       document.body.appendChild(workerUI);
     }
-    if (workerUI) workerUI.textContent='🤖 Queue worker: '+message;
+    if (workerUI) workerUI.textContent='🤖 v'+VERSION+' Queue worker: '+message;
     console.info('[AutoCatalogWorker]',message);
   }
   function workerCall(endpoint, data) {
@@ -418,6 +419,40 @@
     return false;
   }
 
+  // The website global search searches batches ONLY. Once the course's own
+  // subject/chapter/lecture cards are on the page, never search by chapter text.
+  function courseEvidence(job) {
+    const cards = [...document.querySelectorAll(
+      '[data-video-id],[data-subject-id],[data-topic-id],[data-chapter-id],[data-id]'
+    )].filter(el => visible(el) && !el.closest('#globalSearchModal') &&
+      !el.closest('#vc-catalog-worker-status'));
+    const idOf = el => ['data-video-id','data-subject-id','data-topic-id',
+      'data-chapter-id','data-id'].map(k=>el.getAttribute(k)).find(validId);
+    const relevant = cards.filter(el => validId(idOf(el)) && (
+      el.hasAttribute('data-video-id') || el.hasAttribute('data-subject-id') ||
+      el.hasAttribute('data-topic-id') || el.hasAttribute('data-chapter-id') ||
+      /\d+\s+(?:chapters?|lectures?)\b/i.test(el.innerText || '')
+    ));
+    const mainText = (document.querySelector('#mainContent')?.innerText || '')
+      .replace(/\s+/g,' ').toLowerCase();
+    const hasName = [job.chapter_name,job.subject_name]
+      .filter(n => typeof n === 'string' && n.trim().length >= 5)
+      .some(n => mainText.includes(n.trim().toLowerCase()));
+    return {cards:relevant, inCourse:relevant.length>0 || hasName};
+  }
+
+  function closeGlobalSearch(job) {
+    const modal=document.querySelector('#globalSearchModal');
+    if (!modal || !modal.classList.contains('active') || !visible(modal))
+      return false;
+    const close=document.querySelector('#globalSearchCloseBtn');
+    if (close && visible(close))
+      return clickNative(close,'Closing unrelated batch search; using course cards',job);
+    workerStatus('Close website batch search to reach course cards');
+    nextTickDelay=3500;
+    return true;
+  }
+
   function navigateByWebsite(job) {
     if (location.pathname !== '/index.php' && location.pathname !== '/') {
       if (location.pathname.startsWith('/verify-task/')) {
@@ -429,52 +464,49 @@
       location.assign(new URL('/index.php',location.origin).href);
       return true;
     }
-    // Start at the deepest currently visible course level, then walk backwards
-    // through website UI. The lecture card alone can generate the valid URL.
-    const video = elementFor('[data-video-id]','data-video-id',job.video_id);
-    if (video) return clickNative(video,'Clicking authorised lecture card',job);
 
-    const ch = elementFor('[data-topic-id],[data-chapter-id],[data-id]',
-      'data-topic-id',job.chapter_id) ||
-      elementFor('[data-topic-id],[data-chapter-id],[data-id]',
-      'data-chapter-id',job.chapter_id) ||
-      elementFor('[data-topic-id],[data-chapter-id],[data-id]',
-      'data-id',job.chapter_id,
-        e => /\d+\s*lectures?/i.test(e.innerText || ''));
-    if (ch) return clickNative(ch,'Opening chapter via website',job);
+    const state=courseEvidence(job);
+    const modal=document.querySelector('#globalSearchModal');
+    const modalOpen=!!modal && modal.classList.contains('active') && visible(modal);
 
-    const subject = elementFor('[data-subject-id],[data-id]',
-      'data-subject-id',job.subject_id) ||
-      elementFor('[data-subject-id],[data-id]',
-      'data-id',job.subject_id,
-        e => /\d+\s*chapters?/i.test(e.innerText || ''));
-    if (subject) return clickNative(subject,'Opening subject via website',job);
+    // A leftover modal may show an old chapter query from an earlier script.
+    // Dismiss it before trying a real card; never search chapters globally.
+    if (modalOpen && state.inCourse) return closeGlobalSearch(job);
 
-    const batch = elementFor('#globalSearchResults [data-batch-id]',
-      'data-batch-id',job.batch_id);
-    if (batch) return clickNative(batch,'Opening batch via website',job);
+    // Always inspect the site's real course cards, not search-result labels.
+    if (!modalOpen) {
+      const video = elementFor('[data-video-id]','data-video-id',job.video_id);
+      if (video) return clickNative(video,'Opening lecture from its video card',job);
 
-    // Do not type a chapter's label into the global batch-search modal when
-    // already looking at subjects, chapters or lectures. This is a state
-    // mismatch, not evidence that a different batch should be searched.
-    const courseView = [...document.querySelectorAll(
-      '#mainContent [data-video-id], #mainContent [data-subject-id], ' +
-      '#mainContent [data-topic-id], #mainContent [data-chapter-id], ' +
-      '#mainContent [data-id]'
-    )].some(el => visible(el) && (
-      el.hasAttribute('data-video-id') || el.hasAttribute('data-subject-id') ||
-      el.hasAttribute('data-topic-id') || el.hasAttribute('data-chapter-id') ||
-      /\d+\s+(?:lectures?|chapters?)\b/i.test(el.innerText || '')
-    ));
-    if (courseView) {
-      workerStatus('Course view open but target card missing; not using global batch search');
-      nextTickDelay = 5000;
-      return false;
+      const ch = elementFor('[data-topic-id],[data-chapter-id],[data-id]',
+        'data-topic-id',job.chapter_id) ||
+        elementFor('[data-topic-id],[data-chapter-id],[data-id]',
+          'data-chapter-id',job.chapter_id) ||
+        elementFor('[data-topic-id],[data-chapter-id],[data-id]',
+          'data-id',job.chapter_id,e=>/\d+\s*lectures?/i.test(e.innerText||''));
+      if (ch) return clickNative(ch,'Opening chapter from its data-id card',job);
+
+      const subject = elementFor('[data-subject-id],[data-id]',
+        'data-subject-id',job.subject_id) ||
+        elementFor('[data-subject-id],[data-id]',
+          'data-id',job.subject_id,e=>/\d+\s*chapters?/i.test(e.innerText||''));
+      if (subject) return clickNative(subject,'Opening subject from its data-id card',job);
+
+      if (state.inCourse) {
+        workerStatus('Course cards visible but target ID not loaded; no global search');
+        nextTickDelay=4500;
+        return false;
+      }
     }
 
+    // Search is valid only for the BATCH at the site home/search level.
+    const batch = elementFor('#globalSearchResults [data-batch-id]',
+      'data-batch-id',job.batch_id);
+    if (batch) return clickNative(batch,'Opening matching batch search result',job);
+
     if (searchBatch(job)) return true;
-    workerStatus('Waiting for normal website batch/subject UI; open batch search if needed');
-    nextTickDelay = 3000;
+    workerStatus('Waiting for batch search result; subject/chapter use cards only');
+    nextTickDelay=3500;
     return false;
   }
 
