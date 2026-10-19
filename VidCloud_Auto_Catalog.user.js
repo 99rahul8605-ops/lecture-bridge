@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VidCloud Auto Catalog Sync (metadata only)
 // @namespace    lecture-bridge/catalog
-// @version      2.3.0
-// @description  Fix chapter-card navigation and stale global-search modal. Existing permitted uploader unchanged.
+// @version      3.0.0
+// @description  Stage-aware batch search and exact-ID course-card navigation; existing permitted uploader unchanged.
 // @match        https://vidcloud.eu.org/*
 // @run-at       document-start
 // @grant        unsafeWindow
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
   const BRIDGE = 'https://ubuntu-production-9d09.up.railway.app';
-  const VERSION = '2.3.0';
+  const VERSION = '3.0.0';
   const w = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const STORAGE = 'vc_auto_catalog_ctx';
   const keyId = 'catalogSyncKey';
@@ -301,6 +301,7 @@
   // queue -> correct player -> existing authorised export button -> verified success.
   // ---------------------------------------
   const RUN_FLAG = 'vc_catalog_worker_in_this_tab';
+  const NAV_BUDGET_KEY = 'vc_catalog_nav_budget';
   const TAB_ID = 'vc_catalog_worker_tab_id';
   const validJob = j => j && [j.batch_id,j.subject_id,j.chapter_id,j.video_id]
     .every(validId) && typeof j.title === 'string';
@@ -398,9 +399,14 @@
     }
     const modal = document.querySelector('#globalSearchModal');
     if (modal && !modal.classList.contains('active')) {
+      const mainSearch=document.querySelector(mainSearchSelector);
+      if (mainSearch && visible(mainSearch))
+        return clickNative(mainSearch,'Open website batch search input',job);
       const opener = [...document.querySelectorAll('button,[role="button"]')]
         .find(b => visible(b) && /search/i.test(
-          (b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '') + ' ' + (b.id || '')));
+          (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') +
+          ' ' + (b.innerText || '') + ' ' + (b.id || '') +
+          ' ' + (b.querySelector('svg')?.getAttribute('class') || '')));
       if (opener) return clickNative(opener,'Open website batch search',job);
       // Some site layouts keep the search input active without a separate button.
       if (!visible(input)) return false;
@@ -419,94 +425,138 @@
     return false;
   }
 
-  // The website global search searches batches ONLY. Once the course's own
-  // subject/chapter/lecture cards are on the page, never search by chapter text.
-  function courseEvidence(job) {
-    const cards = [...document.querySelectorAll(
-      '[data-video-id],[data-subject-id],[data-topic-id],[data-chapter-id],[data-id]'
-    )].filter(el => visible(el) && !el.closest('#globalSearchModal') &&
-      !el.closest('#vc-catalog-worker-status'));
-    const idOf = el => ['data-video-id','data-subject-id','data-topic-id',
-      'data-chapter-id','data-id'].map(k=>el.getAttribute(k)).find(validId);
-    const relevant = cards.filter(el => validId(idOf(el)) && (
-      el.hasAttribute('data-video-id') || el.hasAttribute('data-subject-id') ||
-      el.hasAttribute('data-topic-id') || el.hasAttribute('data-chapter-id') ||
-      /\d+\s+(?:chapters?|lectures?)\b/i.test(el.innerText || '')
-    ));
-    const mainText = (document.querySelector('#mainContent')?.innerText || '')
-      .replace(/\s+/g,' ').toLowerCase();
-    const hasName = [job.chapter_name,job.subject_name]
-      .filter(n => typeof n === 'string' && n.trim().length >= 5)
-      .some(n => mainText.includes(n.trim().toLowerCase()));
-    return {cards:relevant, inCourse:relevant.length>0 || hasName};
+  // NAV_CORE_BEGIN. Pure decision function, exercised by tests in test_navigation.cjs.
+  // Global search is batch-only. NEVER infer a course page just because ANY
+  // data-video-id is visible: the home page has "Recently Watched" lecture cards.
+  function decideNavigation(s) {
+    if (s.modalOpen && !s.onHome && s.hasCourseCards) return 'close';
+    if (!s.onHome && s.targetVideo) return 'video';
+    if (!s.onHome && s.targetChapter) return 'chapter';
+    if (!s.onHome && s.targetSubject) return 'subject';
+    if (s.modalOpen && s.targetBatch) return 'batch';
+    if (s.onHome) return 'search';
+    if (s.modalOpen) return 'close';
+    if (s.hasCourseCards) return 'recover';
+    return 'wait';
   }
-
+  // NAV_CORE_END
+  const mainSearchSelector = 'input[placeholder*="Search batches by name"],input[placeholder*="Search batches by"]';
+  const outsideModal = el => !el.closest('#globalSearchModal') &&
+    !el.closest('#vc-catalog-worker-status');
+  const byDataId = (attr, id, test = ()=>true) =>
+    [...document.querySelectorAll('['+attr+']')].find(el => visible(el) &&
+      outsideModal(el) && el.getAttribute(attr) === id && test(el));
+  function visibleCourseCards() {
+    const els = [...document.querySelectorAll(
+      '[data-video-id],[data-subject-id],[data-topic-id],[data-chapter-id],[data-id]')]
+      .filter(el => visible(el) && outsideModal(el));
+    const subjects = els.filter(el =>
+      (el.hasAttribute('data-subject-id') || el.hasAttribute('data-id')) &&
+      /\d+\s*chapters?\s*[|•]/i.test(el.innerText || ''));
+    const chapters = els.filter(el =>
+      (el.hasAttribute('data-topic-id') || el.hasAttribute('data-chapter-id') || el.hasAttribute('data-id')) &&
+      /\d+\s*lectures?\s*[|•]/i.test(el.innerText || '') &&
+      !/\d+\s*chapters?\s*[|•]/i.test(el.innerText || ''));
+    const videos = els.filter(el => el.hasAttribute('data-video-id'));
+    return {subjects, chapters, videos};
+  }
+  function onBatchHome(cards) {
+    // The screenshot /index.php#batches has a Recently Watched video card;
+    // that MUST NOT be considered a course page.
+    if (/^#batches(?:\b|$)/i.test(location.hash)) return true;
+    if (cards.subjects.length || cards.chapters.length) return false;
+    // Distinguish a chapter's lecture cards from the homepage Recently Watched.
+    const lectureTabs = [...document.querySelectorAll('button,[role="tab"]')]
+      .filter(el=>visible(el)).some(el => /^(Lectures|DPP PDF|DPP Quiz)$/i.test(
+        (el.innerText || '').trim()));
+    if (cards.videos.length && lectureTabs) return false;
+    const homepageInput=document.querySelector(mainSearchSelector);
+    if (homepageInput && visible(homepageInput) &&
+        !cards.subjects.length && !cards.chapters.length) return true;
+    return false;
+  }
   function closeGlobalSearch(job) {
-    const modal=document.querySelector('#globalSearchModal');
-    if (!modal || !modal.classList.contains('active') || !visible(modal))
-      return false;
     const close=document.querySelector('#globalSearchCloseBtn');
     if (close && visible(close))
-      return clickNative(close,'Closing unrelated batch search; using course cards',job);
-    workerStatus('Close website batch search to reach course cards');
+      return clickNative(close,'Closing global search to use course cards',job);
+    workerStatus('Close batch-search modal to continue course navigation');
     nextTickDelay=3500;
     return true;
   }
-
+  let noTargetSince=0;
   function navigateByWebsite(job) {
     if (location.pathname !== '/index.php' && location.pathname !== '/') {
       if (location.pathname.startsWith('/verify-task/')) {
         sessionStorage.removeItem(RUN_FLAG);
-        workerStatus('Website verification required; complete it manually, then resume');
+        workerStatus('Website verification required; complete manually and resume');
         return true;
       }
-      workerStatus('Returning to normal website course navigation');
-      location.assign(new URL('/index.php',location.origin).href);
+      workerStatus('Opening website home, not forging player URL');
+      location.assign(new URL('/index.php#batches',location.origin).href);
       return true;
     }
-
-    const state=courseEvidence(job);
+    const cards=visibleCourseCards();
+    let home=onBatchHome(cards);
     const modal=document.querySelector('#globalSearchModal');
     const modalOpen=!!modal && modal.classList.contains('active') && visible(modal);
-
-    // A leftover modal may show an old chapter query from an earlier script.
-    // Dismiss it before trying a real card; never search chapters globally.
-    if (modalOpen && state.inCourse) return closeGlobalSearch(job);
-
-    // Always inspect the site's real course cards, not search-result labels.
-    if (!modalOpen) {
-      const video = elementFor('[data-video-id]','data-video-id',job.video_id);
-      if (video) return clickNative(video,'Opening lecture from its video card',job);
-
-      const ch = elementFor('[data-topic-id],[data-chapter-id],[data-id]',
-        'data-topic-id',job.chapter_id) ||
-        elementFor('[data-topic-id],[data-chapter-id],[data-id]',
-          'data-chapter-id',job.chapter_id) ||
-        elementFor('[data-topic-id],[data-chapter-id],[data-id]',
-          'data-id',job.chapter_id,e=>/\d+\s*lectures?/i.test(e.innerText||''));
-      if (ch) return clickNative(ch,'Opening chapter from its data-id card',job);
-
-      const subject = elementFor('[data-subject-id],[data-id]',
-        'data-subject-id',job.subject_id) ||
-        elementFor('[data-subject-id],[data-id]',
-          'data-id',job.subject_id,e=>/\d+\s*chapters?/i.test(e.innerText||''));
-      if (subject) return clickNative(subject,'Opening subject from its data-id card',job);
-
-      if (state.inCourse) {
-        workerStatus('Course cards visible but target ID not loaded; no global search');
-        nextTickDelay=4500;
-        return false;
-      }
+    const targetVideo=byDataId('data-video-id',job.video_id);
+    const targetChapter=byDataId('data-topic-id',job.chapter_id) ||
+      byDataId('data-chapter-id',job.chapter_id) ||
+      byDataId('data-id',job.chapter_id,e=>/\d+\s*lectures?/i.test(e.innerText || ''));
+    const targetSubject=byDataId('data-subject-id',job.subject_id) ||
+      byDataId('data-id',job.subject_id,e=>/\d+\s*chapters?/i.test(e.innerText || ''));
+    // Visible batch tile may be on home, and global search result inside modal.
+    const targetBatch=[...document.querySelectorAll('#globalSearchResults [data-batch-id]')]
+      .find(el => visible(el) && el.getAttribute('data-batch-id') === job.batch_id);
+    const batchTile=byDataId('data-batch-id',job.batch_id);
+    // A site SPA may preserve #batches while rendering course cards.
+    // Exact target IDs outrank the stale hash; unrelated Recently Watched
+    // items do not, because they have different IDs.
+    if (targetVideo || targetChapter || targetSubject) home=false;
+    const stage = cards.videos.length ? 'lectures' :
+      cards.chapters.length ? 'chapters' :
+      cards.subjects.length ? 'subjects' : 'unknown';
+    let action=decideNavigation({modalOpen,onHome:home,
+      targetVideo:!!targetVideo,targetChapter:!!targetChapter,
+      targetSubject:!!targetSubject,targetBatch:!!targetBatch,
+      hasCourseCards:stage!=='unknown'});
+    if (home && !modalOpen && batchTile) action='batchTile';
+    if (action !== 'wait' && action !== 'recover') noTargetSince=0;
+    console.info('[AutoCatalogWorker] navigation', {
+      stage: home?'home':stage, action, target:job.video_id,
+      subjects:cards.subjects.length,chapters:cards.chapters.length,
+      videos:cards.videos.length,modalOpen
+    });
+    if (action==='close') return closeGlobalSearch(job);
+    if (action==='video') return clickNative(targetVideo,'Opening exact lecture data-video-id',job);
+    if (action==='chapter') return clickNative(targetChapter,'Opening exact chapter data-id',job);
+    if (action==='subject') return clickNative(targetSubject,'Opening exact subject data-id',job);
+    if (action==='batch') return clickNative(targetBatch,'Opening matching batch result',job);
+    if (action==='batchTile') return clickNative(batchTile,'Opening matching batch tile',job);
+    if (action==='search') {
+      if (searchBatch(job)) return true;
+      workerStatus('Searching ONLY target batch; waiting for exact batch ID');
+      nextTickDelay=3500;
+      return false;
     }
-
-    // Search is valid only for the BATCH at the site home/search level.
-    const batch = elementFor('#globalSearchResults [data-batch-id]',
-      'data-batch-id',job.batch_id);
-    if (batch) return clickNative(batch,'Opening matching batch search result',job);
-
-    if (searchBatch(job)) return true;
-    workerStatus('Waiting for batch search result; subject/chapter use cards only');
-    nextTickDelay=3500;
+    // Normal SPA content can take time to appear after a valid card click.
+    // Wait before recovering to avoid clicking the wrong page while it loads.
+    if (!noTargetSince) noTargetSince=Date.now();
+    if (Date.now()-noTargetSince < 18000) {
+      workerStatus('Waiting for website cards ('+stage+'); target not visible yet');
+      nextTickDelay=2500;
+      return false;
+    }
+    // A wrong subject/chapter view is NOT repaired via global batch search
+    // inside that view. Return to the public home then select the right batch.
+    if (action==='recover') {
+      workerStatus('Wrong course level; returning home to select target batch');
+      noTargetSince=0;
+      location.assign(new URL('/index.php#batches',location.origin).href);
+      return true;
+    }
+    workerStatus("Waiting for site's course UI; no target card currently loaded");
+    nextTickDelay=4000;
     return false;
   }
 
@@ -631,11 +681,24 @@
         const onCorrectPlayer=location.pathname==='/play.php' &&
           new URLSearchParams(location.search).get('video_id')===job.video_id;
         if (!onCorrectPlayer || !hasWebsitePlayerContext()) {
-          // Crucial: incomplete 5-parameter URLs trigger "Security fields missing".
-          // Never fabricate the remaining fields; navigate via the site's cards.
+          // Keep an across-page navigation deadline. Do not loop forever when
+          // the website changes or refuses a normal card click.
+          let budget={};
+          try { budget=JSON.parse(sessionStorage.getItem(NAV_BUDGET_KEY)||'{}'); } catch (_) {}
+          if (budget.id !== job.video_id || !Number.isFinite(budget.start)) {
+            budget={id:job.video_id,start:Date.now()};
+            sessionStorage.setItem(NAV_BUDGET_KEY,JSON.stringify(budget));
+          }
+          if (Date.now()-budget.start>240000) {
+            sessionStorage.removeItem(RUN_FLAG);
+            workerStatus('Navigation timed out after 4 minutes; queue preserved. Check course cards.');
+            return;
+          }
+          // Never fabricate site security fields or player URLs.
           navigateByWebsite(job);
           return;
         }
+        sessionStorage.removeItem(NAV_BUDGET_KEY);
         await performJob(job);
         return;
       }

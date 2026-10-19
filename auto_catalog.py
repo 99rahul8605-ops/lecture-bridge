@@ -377,7 +377,7 @@ def mark_delivered(video_id):
 # Queue worker only orchestrates existing, separate and permission-checked uploader.
 # No media URLs, CDN credentials, license requests or media payloads handled here.
 _WORKER_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{8,64}$')
-_WORKER_LEASE_SECONDS = 180
+_WORKER_LEASE_SECONDS = 600
 _MAX_WORKER_ATTEMPTS = 2
 
 

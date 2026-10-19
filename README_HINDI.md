@@ -1,74 +1,56 @@
-# Telegram Auto Catalog + existing MP4 relay success sync (v1.1)
+# Telegram Auto Worker v3.0 — tested navigation & queue patch
 
-## Kya **actually** automate hota hai?
+**Existing project:** `/lecture-bridge` port `8090`, Telegram bot `catalog-control`. **No separate bot.py required.**
 
-- Website par normal browsing se Batch -> Subject -> Chapter IDs aur original **successful** chapter lecture-list API responses se lecture title, status, video ID, time sync hota hai.
-- **Kisi token / cookie / signed MPD URL / DRM key ko upload ya store nahi karta.** `401` URL retry nahi hoti; browser ke successful normal requests ki metadata copy hoti hai.
-- Telegram bot se `/batches`, `/batch`, `/subjects`, `/subject`, `/autochapters`, `/autochapter`, `/lectures`, `/add`, `/queueauto`, `/done` commands.
-- `COMPLETED` + `Ready` lectures hi queue mein aate hain. Scheduled / non-ready items skip. Stable Video IDs se duplicates skip. Queue SQLite mein store.
-- Existing `/txt`, `/importchapters`, old `/chapters`, legacy `/done` (TXT catalog) untouched rehte hain. Naye *pending auto queue* ke liye `/done` media-export-waiting status karta hai. **v1.1:** Existing browser sender jab Railway ka real `status: sent` result receive karta hai, tab catalog script us `video_id` ka queue status `delivered` set karta hai. Agar old uploader full MP4 already bhej raha hai, catalog use block nahi karta.
-- `POST /api/catalog/delivered` can be called **only after** an authorized media-delivery integration confirms success, with JSON `{"videoId":"<24 hex ID>"}` and dedicated `X-Catalog-Key` header.
+## Kya fix hai (pichhle screenshot se)
 
-## Kya abhi nahi hota?
+- `index.php#batches` par **Recently Watched** lecture card hone se worker galat course page nahi samjhega. Home pe **batch global search** hi karega.
+- Railway `worker/next` response mein `batch_name`, `subject_name`, `chapter_name` bhejega. Ye values previous v2.0 mein missing thi; batch search ko `batch_name` chahiye.
+- Batch sirf batch results mein, subject `data-subject-id`/`data-id`, chapter `data-chapter-id`/`data-topic-id`/`data-id`, lecture `data-video-id` se choose hoga. **Lecture name global batch search mein kabhi nahi dala jayega.**
+- Agar screen already kisi unrelated course par hai, worker thoda wait karke normal site home par jayega aur correct batch select karega.
+- Website ke **normal lecture-card click** se `play.php` open hoga. Missing PHP/security parameters create/forge nahi karta.
+- Navigation 4 minute mein na ho toh worker pause; queue preserved. Success sirf purane uploader ke **`✅ Sent to Telegram:`** text ke baad mark hoti hai. Existing permitted uploader bilkul unchanged hai.
+- A 10-minute Railway navigation lease can be renewed by the active browser tab. One worker at a time.
 
-- Telegram `/done` **khud video download/send start nahi karta**. Browser ka existing **Send MP4 to Telegram** button pehle jaise manually trigger hoga. Is update mein Telegram success ka status-sync auto ho gaya hai, media export nahi.
-- No DRM decryption, license extraction or signing-key bypass. `drmProtected: true` wala metadata flag apne aap working existing uploader ko block nahi karta; lekin har stream exportable hone ka proof bhi nahi hai.
-- Browser must be open and signed in to load website pages/normal API responses. Railway server itself cannot list full protected catalog without proper provider-supported credentials/API. It is **not** always-on headless browsing.
-- First-time catalog coverage requires navigating desired batch/subject/chapter screens. Future lectures sync when browser normally loads that chapter again. It does not silently force the site to open every chapter.
-- Install/restart steps require server access; not deployed on your Railway service by this ZIP.
+## Setup (sirf ek baar)
 
-## Setup (no `.env`/token included)
+**Koi upload chal raha ho toh complete hone do.** ZIP extract karke GitHub `lecture-bridge` repository root mein ye files upload/replace karo:
 
-1. ZIP unzip karo; existing Railway `app.py`, `bot.py` ki copy/backup rakho. **Do not replace existing relay_api.py**, upload script, bot token or existing server process.
-2. Ek nayi **dedicated catalog key** banao, e.g. `python3 -c 'import secrets;print(secrets.token_urlsafe(32))'`. Railway bridge environment aur bot environment **dono** mein `CATALOG_SYNC_KEY=<same key>` set karo. Telegram bot environment mein `OWNER_ID=<your Telegram numeric user id>` should be set. Bridge mein bhi same `OWNER_ID` recommended. Kabhi chat mein key paste mat karna.
-3. Railway bridge environment: `AUTO_CATALOG_DB=/data/auto_catalog.sqlite3` (agar persistent Railway volume `/data` mount ho). Agar volume nahi hai, writable persistent volume configure karo, warna deploy ke baad queue/catalog reset ho sakte hain. Existing `RELAY_ALLOWED_ORIGIN=https://vidcloud.eu.org` unchanged.
-4. Telegram bot environment: `CATALOG_BASE_URL=https://ubuntu-production-9d09.up.railway.app` and the same `CATALOG_SYNC_KEY`. **Existing** `BOT_TOKEN`, `API_ID`, `API_HASH` etc. unchanged.
-5. `auto_catalog.py`, `catalog_web.py`, `catalog_bot_client.py`, and `install_into_repo.py` files ek directory (e.g. `/tmp/auto-catalog`) mein rakho. Python3 se command chalao:
+- `auto_catalog.py`
+- `VidCloud_Auto_Catalog.user.js`
+- `deploy_v3.sh`
+- `test_worker.py`, `test_catalog_existing.py`, `test_navigation.cjs`, `test_search.cjs` (local testing + deployment checks)
 
-   ```bash
-   python3 install_into_repo.py --bridge-dir /lecture-bridge --bot-dir /path/to/current/bot
-   ```
+Railway terminal:
 
-   Agar bot aur bridge same folder mein hain, dono flags mein same path do. Agar sirf bridge update hai, `--bridge-dir` only. Installer original `app.py` aur `bot.py` ka `.catalog-bak` backup banata hai, **relay_api.py ko nahi chhoota**, aur syntax compile karta hai. Bot mein expected old `chapter_queue` code na mile toh modify nahi karta; version mismatch hone par manual review needed.
-6. Existing Gunicorn/screen **bridge process restart** karo (1 worker recommended per old relay code). Existing bot service bhi restart karo. Don't launch duplicate bot sessions. `/health` pehle ki tarah valid hona chahiye.
-7. Chrome Tampermonkey mein **updated v1.1** `VidCloud_Auto_Catalog.user.js` install/update karo. Existing "Send MP4 to Telegram" script ko replace nahi karna. Tampermonkey menu > **Configure catalog sync key** > dedicated key enter karo. Key extension mein stored hoti hai, website mein post nahi hoti. Agar v1.0 pehle installed hai to replace/update karo, duplicate scripts mat rakho.
-8. Website open karo, global search -> batch select -> subject -> chapter list. Normal lecture API jab successful load hoti hai, `data[]` se status and titles sync ho jaate hain. Expected Chrome Console may log `[AutoCatalog]` errors on unauthorized key/bridge failures.
-9. **Delivery tracking test:** Telegram bot mein lecture select karo aur `/done` bhejo **pehle**, phir usi lecture ke `play.php?video_id=...` page par existing **Send MP4 to Telegram** button use karo. Normal uploader ka Railway status `sent` aane ke baad `/queueauto` mein `delivered` hona chahiye. Script sirf Railway result observe karti hai; bina upload success ke delivered nahi mark hota.
-10. Agar `play.php` ke query mein catalog wala 24-character `video_id` nahi hai, tracker ID match nahi kar sakta. Console warning aayegi; tab video still Telegram pahunch sakti hai, lekin automatic delivered marking nahi hogi.
-
-## Telegram commands
-
-```text
-/syncstatus     # currently synced counts
-/batches        # synced batch list
-/batch 1        # choose batch
-/subjects       # list subjects of chosen batch
-/subject 2      # choose subject
-/autochapters   # show chapter list
-/autochapter 3  # choose chapter
-/lectures       # list lectures; ✅ = Ready, ⏳ = not confirmed ready
-/add 5          # first 5 chapter lectures
-/add 2-4        # indices 2,3,4
-/add 1,3,5      # specific lectures
-/add all        # all Ready; duplicate and scheduled skip
-/queueauto      # queued metadata status
-/done           # prepare new auto queue entries for authorized export
-/autoclear      # remove pending/waiting items, preserve delivered history
+```bash
+cd /lecture-bridge
+git pull --ff-only
+bash deploy_v3.sh
 ```
 
-**Do not mistake `/done` for a finished Telegram MP4 upload.** It only marks catalog-selected items as `awaiting_export`. The existing browser uploader still performs the actual export on user action and its real successful Telegram send auto-confirms catalog status. Old TXT `/done` behavior remains intact when there is no pending auto queue.
+Ye script previous Git commit se temporary backup banata hai, Python tests chalata hai, agar `node` installed hai toh JS mock tests bhi, phir **sirf port 8090 ke ek Gunicorn master** ko HUP karta hai. Dusre bots ko nahi chhedta. Existing `catalog-control` Telegram bot restart **required nahi**. `.env` aur SQLite queue delete nahi kiye jaate.
 
-## Troubleshooting
+Tampermonkey dashboard mein *existing* `VidCloud Auto Catalog Sync` script ko EDIT karke naye `VidCloud_Auto_Catalog.user.js` ka **poora text paste, save** karo. Duplicate v2.1/v2.2/v2.3 copies OFF rakho. Existing `Railway_Auto_Telegram.user.js` yani **Send MP4 to Telegram** script ON hi rakho. Purani saved catalog key same script namespace mein rehni chahiye; agar missing ho, Tampermonkey menu se Configure key karo (Railway secret chat mein share nahi karna).
 
-- `/syncstatus` empty: Tampermonkey key not configured; initial website pages not visited; wrong `CATALOG_BASE_URL`; or website changed HTML/API. `/health` and browser Console first.
-- Site API `401` from manual Console fetch is irrelevant here; script does not manually retry authenticated video metadata requests.
-- `batches` appears, but no subjects/chapters: select the batch using website card first (click tracking supplies GUI ID). Navigate subjects and chapters once. Refresh the chapter page if the extension script was just installed.
-- `lectures` marked ⏳ despite playable video: HTML sees ID but lacks authoritative normal successful API status. Open chapter again, let its normal `/contents?tag=...&contentType=videos&page=1` load. No credentials required outside website.
-- Bot and bridge in separate Railway deployments: don't rely on SQLite shared filesystem; bot uses the dedicated remote catalog API. Volume is for bridge only.
-- If files in installed repo differ from the provided earlier bot version, test in backup staging before production deploy. Never delete existing bot or relay data.
-- `drmProtected: true` is metadata, not a queue rejection check. A DRM license/authorization failure in a different stream cannot be fixed by this package; do not remove existing uploader safeguards.
-- **Bot-only one-click playback/export is not provided.** Browser tab must stay open for the existing uploader, and its Send MP4 button still needs to be clicked.
+## Single-lecture end-to-end acceptance test
 
-## Tests
+1. Pehle Telegram `/autostop`, phir `/autoretry` (old failures/retry counters reset) aur `/queueauto`. Agar selected lectures awaiting_export mein hain toh re-add ki zaroorat nahi.
+2. Chrome **same logged-in tab** par `https://vidcloud.eu.org/index.php#batches` kholo, global search modal close kar do.
+3. Telegram `/autostart`, Chrome Tampermonkey > **Start Telegram queue worker IN THIS TAB**.
+4. Bottom-left `v3.0.0` dikhe. **Expected:** correct CA Inter batch name search → exact batch ID click → correct subject ID → chapter ID → lecture video ID → site-generated 11-parameter `play.php` → existing upload button → Telegram MP4 delivery → `/queueauto` shows delivered.
+5. **Sirf pehla lecture test karna hai toh** Chrome jab uska player khol de, Telegram par `/autostop` bhejo. Current upload complete ho sakta hai; agla lecture assign nahi hoga. Delivery verify hone par `/autostart` se baki queue resume karo. Chrome tab open/logged-in rehna hai.
 
-Run `PYTHONPATH=. python3 -m unittest discover -s tests -v` in ZIP folder. The standalone data-model tests cover selection, skipping scheduled items, duplicates, delivered state, and avoiding media URL storage. Live website/TG/Railway authentication was **not** tested by the packager.
+Agar page par **`Security fields missing`**, verification, ya encrypted/unsupported media ka error aaye, worker access control bypass nahi karta. Authorization site ke normal flow se chahiye.
+
+## Test evidence
+
+- Python tests: 6/6 passed (queue states, duplicate, scheduled, lock, metadata, names).
+- Mocked JS navigation cases: 9/9 passed (home recently-watched, search result, subject/chapter/lecture ID, stale URL hash, modal close, wrong-course recovery).
+- JS search tests: 4/4 passed (open batch search, fill correct batch name, reject chapter/subject text).
+- `node --check` passed.
+- **Not live-tested:** private logged-in vidcloud.eu.org browser, actual Railway deployment, CDN video conversion and Telegram delivery. Cannot truthfully guarantee 100% success before that acceptance test.
+
+## Safe rollback
+
+Old code saved under `/tmp/lecture-worker-v3-YYYYMMDD-HHMMSS/` by deploy script, and previous Git commit. Chrome script rollback via Tampermonkey editor/previous saved version; server rollback requires restoring previous `auto_catalog.py` and HUP reloading *only the 8090 master*. Never run `fuser -k 8090/tcp` just to reload code.

@@ -46,6 +46,12 @@ class WorkerTest(unittest.TestCase):
         first=r['lecture']['video_id']
         self.assertEqual(first,self.ids[0])
         self.assertEqual(r['lecture']['batch_id'],self.batch)
+        self.assertEqual(r['lecture']['batch_name'],'Batch')
+        self.assertEqual(r['lecture']['subject_name'],'Subject')
+        self.assertEqual(r['lecture']['chapter_name'],'Chapter')
+        self.assertEqual(r['lecture']['batch_name'],'Batch')
+        self.assertEqual(r['lecture']['subject_name'],'Subject')
+        self.assertEqual(r['lecture']['chapter_name'],'Chapter')
         self.assertEqual(m.worker_next(self.browserB)['state'],'busy')
         self.assertEqual(m.worker_next(self.browserA)['lecture']['video_id'],first)
         self.assertTrue(m.worker_heartbeat(self.browserA,first)['active'])
