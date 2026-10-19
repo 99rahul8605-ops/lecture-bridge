@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.7.0-resume
+// @version      2.7.1-conflict-safe
 // @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
@@ -140,6 +140,91 @@
       }
     }
   }
+
+  // BEGIN SAFE SERVER-ACK RETRY
+  // A browser request may time out *after Railway has started receiving bytes*.
+  // A quick repost then returns 409 "Duplicate segment still in progress".
+  // Poll the server's RECEIVED indices instead of hammering the same POST.
+  // Requires the resumable backend's received_indices status field.
+  const CONFLICT_ACK_WAIT_MS = 11 * 60 * 1000;
+
+  async function readRelaySegmentStatus(jobId, key, index) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(`${RELAY}/api/relay/${encodeURIComponent(jobId)}/status`, {
+        signal: controller.signal,
+        headers: key ? {'X-Relay-Key': key} : {}
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const e = new Error(`Railway status HTTP ${response.status}`);
+        e.httpStatus = response.status;
+        throw e;
+      }
+      if (!Array.isArray(body.received_indices))
+        throw new Error('Railway resumable status missing received_indices; check backend patch');
+      return {accepted: body.received_indices.includes(index), state: body.status};
+    } finally { clearTimeout(timer); }
+  }
+
+  async function safeUploadSegment(jobId, index, key, data, onNotice) {
+    const path = `/api/relay/${encodeURIComponent(jobId)}/segment/${index}`;
+    for (let attempt = 0; attempt <= RETRY_BACKOFF_MS.length; attempt++) {
+      try {
+        return await api(path, key, data, UPLOAD_TIMEOUT_MS);
+      } catch (error) {
+        if (!shouldRetry(error)) throw error;
+        // The original HTTP request might still be completing on Railway,
+        // even when Chrome reports timeout/Failed to fetch.
+        try {
+          const snapshot = await readRelaySegmentStatus(jobId, key, index);
+          if (snapshot.accepted) {
+            onNotice(`✅ Railway already saved segment ${index + 1}; continuing without duplicate upload.`);
+            return {already_received: true};
+          }
+        } catch (statusError) {
+          // Missing / expired jobs should fail clearly, not generate a new upload.
+          if (statusError.httpStatus === 404 || /missing received_indices/.test(statusError.message || ''))
+            throw statusError;
+        }
+        const conflict = Number(error.httpStatus) === 409 &&
+          /duplicate segment still in progress/i.test(error.message || '');
+        if (conflict) {
+          onNotice(`⏳ Railway is STILL receiving segment ${index + 1}. Waiting for its ACK; no duplicate POST.`);
+          const deadline = Date.now() + CONFLICT_ACK_WAIT_MS;
+          let consecutiveStatusErrors = 0;
+          while (Date.now() < deadline) {
+            await wait(5000);
+            let snapshot;
+            try {
+              snapshot = await readRelaySegmentStatus(jobId, key, index);
+              consecutiveStatusErrors = 0;
+            } catch (statusError) {
+              if (statusError.httpStatus === 404 || /missing received_indices/.test(statusError.message || ''))
+                throw statusError;
+              if (++consecutiveStatusErrors >= 6)
+                throw new Error(`Railway status unavailable while waiting for segment ${index + 1}`);
+              continue;
+            }
+            if (snapshot.accepted) {
+              onNotice(`✅ Railway confirmed segment ${index + 1}; no re-upload needed.`);
+              return {already_received: true};
+            }
+            if (snapshot.state !== 'uploading')
+              throw new Error(`Railway job changed to ${snapshot.state || 'unknown'} before segment ${index + 1} was saved.`);
+          }
+          // The first request is *possibly* still in progress. Do not blindly
+          // re-send bytes or mark success; fail this lecture for Retry Later.
+          throw new Error(`Segment ${index + 1} still unacknowledged after 11 minutes (409). Retry lecture later; saved segments stay cached.`);
+        }
+        if (attempt >= RETRY_BACKOFF_MS.length) throw error;
+        onNotice(`Retrying VPS segment ${index + 1} (${attempt + 1}/${RETRY_BACKOFF_MS.length}): ${error.message}`);
+        await wait(RETRY_BACKOFF_MS[attempt]);
+      }
+    }
+  }
+  // END SAFE SERVER-ACK RETRY
 
   async function fetchSegment(segmentUrl, index) {
     const controller = new AbortController();
@@ -335,13 +420,11 @@
             renderStats();
             const uploadBegan = performance.now();
             try {
-              await retrySegment(`Railway segment ${i + 1}`,
-                () => api(`/api/relay/${encodeURIComponent(job.job_id)}/segment/${i}`, key, data, UPLOAD_TIMEOUT_MS),
-                (attempt, limit, error) => {
-                  lane.phase = `retry upload ${attempt}/${limit}`;
-                  say(`Retrying VPS upload segment ${i + 1} (${attempt}/${limit}): ${error.message}`);
-                  renderStats();
-                });
+              await safeUploadSegment(job.job_id, i, key, data, (message) => {
+                lane.phase = 'waiting for Railway ACK';
+                say(message);
+                renderStats();
+              });
               uploaded++;
               uploadBytes += data.byteLength;
               lane.uploadRate = rate(data.byteLength, performance.now() - uploadBegan);
