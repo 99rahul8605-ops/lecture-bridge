@@ -27,7 +27,8 @@ HELP = (
     '/syncstatus, /batches, /batch 1, /subjects, /subject 1, '
     '/autochapters, /autochapter 1, /lectures, /add all, '
     '/queueauto, /done, /autoclear\n'
-    'Note: /done prepares metadata; existing uploader handles MP4 separately.'
+    '/autostatus, /autostop, /autostart, /autoretry\n'
+    'Run Tampermonkey Auto Catalog > Start queue worker once; /done starts queued exports via existing authorized uploader.'
 )
 
 @client.on(events.NewMessage(incoming=True, pattern=r'^/([A-Za-z]+)(?:@\w+)?(?:\s+([\s\S]*))?$'))

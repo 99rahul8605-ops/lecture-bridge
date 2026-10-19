@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VidCloud Auto Catalog Sync (metadata only)
 // @namespace    lecture-bridge/catalog
-// @version      1.1.0
-// @description  Sync lecture metadata; mark queued items delivered when the EXISTING browser uploader confirms Telegram success. No media download or DRM changes.
+// @version      2.0.0
+// @description  Auto open queued lecture pages and trigger existing permitted uploader; success-confirmed delivery only, no DRM changes.
 // @match        https://vidcloud.eu.org/*
 // @run-at       document-start
 // @grant        unsafeWindow
@@ -271,4 +271,219 @@
   };
   if (document.readyState==='loading') document.addEventListener('DOMContentLoaded',init,{once:true});
   else init();
+
+  // ---------------------------------------
+  // Opt-in browser queue worker (no media code):
+  // queue -> correct player -> existing authorised export button -> verified success.
+  // ---------------------------------------
+  const RUN_FLAG = 'vc_catalog_worker_in_this_tab';
+  const TAB_ID = 'vc_catalog_worker_tab_id';
+  const validJob = j => j && [j.batch_id,j.subject_id,j.chapter_id,j.video_id]
+    .every(validId) && typeof j.title === 'string';
+  const pause = ms => new Promise(resolve => setTimeout(resolve,ms));
+  let workerBusy = false;
+  let workerTimer = null;
+  let workerUI = null;
+
+  function tabId() {
+    let id=sessionStorage.getItem(TAB_ID);
+    if (!id) {
+      id='tab_' + (crypto.randomUUID ? crypto.randomUUID().replace(/-/g,'') :
+        Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,'0')).join(''));
+      sessionStorage.setItem(TAB_ID,id);
+    }
+    return id;
+  }
+  function running() { return sessionStorage.getItem(RUN_FLAG)==='1'; }
+  function workerStatus(message) {
+    if (!running() && !workerUI) return;
+    if (!workerUI && document.body) {
+      workerUI=document.createElement('div');
+      workerUI.id='vc-catalog-worker-status';
+      workerUI.style.cssText='position:fixed;bottom:12px;left:12px;z-index:2147483600;'+
+        'background:#14263a;color:#fff;border-radius:8px;padding:8px 12px;'+
+        'max-width:330px;font:12px system-ui;box-shadow:0 2px 12px #0006';
+      document.body.appendChild(workerUI);
+    }
+    if (workerUI) workerUI.textContent='🤖 Queue worker: '+message;
+    console.info('[AutoCatalogWorker]',message);
+  }
+  function workerCall(endpoint, data) {
+    return new Promise((resolve,reject) => {
+      const key=GM_getValue(keyId,'');
+      if(key.length<24) return reject(new Error('Configure Catalog key in Tampermonkey'));
+      GM_xmlhttpRequest({
+        method:'POST',url:BRIDGE+'/api/catalog/worker/'+endpoint,
+        headers:{'X-Catalog-Key':key,'Content-Type':'application/json'},
+        data:JSON.stringify({browserId:tabId(),...data}),timeout:20000,
+        onload:r => {
+          let result={};
+          try{result=JSON.parse(r.responseText||'{}');}catch(_){}
+          if(r.status!==200) reject(new Error('Worker HTTP '+r.status+': '+(result.error||'request failed')));
+          else resolve(result);
+        },
+        onerror:()=>reject(new Error('Railway worker unavailable')),
+        ontimeout:()=>reject(new Error('Railway worker timed out'))
+      });
+    });
+  }
+  function targetUrl(job) {
+    const u=new URL('/play.php',location.origin);
+    u.searchParams.set('batch_id',job.batch_id);
+    u.searchParams.set('subject_id',job.subject_id);
+    u.searchParams.set('topic_id',job.chapter_id);
+    u.searchParams.set('video_id',job.video_id);
+    u.searchParams.set('video_name',job.title);
+    return u.toString();
+  }
+  function hasHlsManifest() {
+    return performance.getEntriesByType('resource').some(r=> {
+      try { return /\.(?:docx|m3u8)$/i.test(new URL(r.name).pathname); }
+      catch(_) { return false; }
+    });
+  }
+  async function completeJob(job,status,error='') {
+    // A successful result is acknowledged only after the independent existing
+    // uploader shows its real post-Telegram status: "✅ Sent to Telegram".
+    const result=await workerCall('finish',{videoId:job.video_id,outcome:status,error:String(error).slice(0,220)});
+    if (result.state!=='delivered' && result.state!=='failed')
+      throw new Error('Worker finish not acknowledged: '+result.state);
+    workerStatus(`${status}: ${job.title.slice(0,35)}. Next...`);
+    await pause(1800);
+    location.assign(new URL('/index.php',location.origin).href);
+  }
+  async function performJob(job) {
+    let heartbeat;
+    let leaseActive=true;
+    let clicked=false;
+    try {
+      const initial=await workerCall('heartbeat',{videoId:job.video_id});
+      if(!initial.active) throw new Error('Assignment expired; wait for next claim');
+      heartbeat=setInterval(()=>workerCall('heartbeat',{videoId:job.video_id}).then(r=>{
+        if(!r.active) leaseActive=false;
+      }).catch(err=>console.warn('[AutoCatalogWorker] heartbeat:',err.message)),25000);
+      workerStatus('Opening '+job.title.slice(0,48));
+      const deadline=Date.now()+4*60*1000;
+      let button=null;
+      let playAttemptAt=0;
+      while(Date.now()<deadline) {
+        if(!leaseActive) throw new Error('Worker assignment lost');
+        if(location.pathname!=='/play.php' ||
+           new URLSearchParams(location.search).get('video_id')!==job.video_id)
+          throw new Error('Wrong player lecture');
+        const video=document.querySelector('video');
+        if(video && video.paused && Date.now()-playAttemptAt>10000) {
+          playAttemptAt=Date.now();
+          // Muted HTML5 playback is normally allowed by browser autoplay policy.
+          // This does not access encrypted frames or obtain a DRM licence.
+          video.muted=true;
+          video.play().catch(()=>{});
+        }
+        button=document.querySelector('#railway-lecture-link-v1 button');
+        if(button && !button.disabled && hasHlsManifest()) break;
+        workerStatus('Waiting for existing uploader + player playlist...');
+        await pause(2500);
+      }
+      if(!button || !hasHlsManifest())
+        throw new Error('Existing uploader or supported HLS playlist not available (autoplay may be blocked)');
+      // Do not double-send after a transient catalog confirmation error.
+      const existing=(document.querySelector('#railway-lecture-link-v1 .relay-message')?.textContent||'').trim();
+      if(existing.startsWith('✅ Sent to Telegram:')) {
+        await completeJob(job,'delivered');
+        return;
+      }
+      if(existing.startsWith('Failed:')) {
+        await completeJob(job,'failed',existing);
+        return;
+      }
+      button.click();
+      clicked=true;
+      workerStatus('Uploader started for '+job.title.slice(0,45));
+      const uploadDeadline=Date.now()+3*60*60*1000;
+      let lastText='';
+      while(Date.now()<uploadDeadline) {
+        if(!leaseActive) throw new Error('Worker assignment lost during upload');
+        const info=document.querySelector('#railway-lecture-link-v1 .relay-message');
+        const txt=(info?.textContent||'').trim();
+        if(txt.startsWith('✅ Sent to Telegram:')) {
+          await completeJob(job,'delivered');
+          return;
+        }
+        if(txt.startsWith('Failed:')) {
+          await completeJob(job,'failed',txt);
+          return;
+        }
+        if(txt && txt!==lastText) {
+          lastText=txt;
+          workerStatus(txt.slice(0,110));
+        }
+        await pause(2500);
+      }
+      throw new Error('Upload timeout after 3 hours');
+    } catch(err) {
+      workerStatus('Error: '+String(err.message||err).slice(0,95));
+      console.error('[AutoCatalogWorker]',err);
+      if(!clicked) {
+        try { await completeJob(job,'failed',err.message||String(err)); }
+        catch(e) { console.warn('[AutoCatalogWorker] finish failed:',e.message); }
+      } else {
+        // Stop to prevent accidentally sending the same video twice.
+        sessionStorage.removeItem(RUN_FLAG);
+        workerStatus('Upload state uncertain. Check Telegram/Railway before retry.');
+      }
+    } finally {
+      if(heartbeat) clearInterval(heartbeat);
+    }
+  }
+  async function workerTick() {
+    if(!running() || workerBusy) return;
+    workerBusy=true;
+    try {
+      const result=await workerCall('next',{});
+      if(result.state==='assigned') {
+        const job=result.lecture;
+        if(!validJob(job)) throw new Error('Bad lecture metadata');
+        const onCorrectPlayer=location.pathname==='/play.php' &&
+          new URLSearchParams(location.search).get('video_id')===job.video_id;
+        if(!onCorrectPlayer) {
+          workerStatus('Navigating to '+job.title.slice(0,42));
+          location.assign(targetUrl(job));
+          return;
+        }
+        await performJob(job);
+        return;
+      }
+      workerStatus(result.state==='paused'?'Paused by Telegram /autostop':
+        result.state==='empty'?'Queue empty; waiting for /done':
+        result.state==='busy'?'Another worker tab busy':'Waiting');
+    } catch(err) {
+      workerStatus('Error: '+String(err.message||err).slice(0,95));
+      console.warn('[AutoCatalogWorker]',err);
+    } finally {
+      workerBusy=false;
+      if(running()) workerTimer=setTimeout(workerTick,10000);
+    }
+  }
+  GM_registerMenuCommand('▶ Start Telegram queue worker IN THIS TAB',()=>{
+    if(GM_getValue(keyId,'').length<24) {
+      alert('First Configure catalog sync key in Tampermonkey.');return;
+    }
+    sessionStorage.setItem(RUN_FLAG,'1');
+    tabId();
+    workerStatus('Enabled in this tab; waiting for Telegram /done');
+    clearTimeout(workerTimer);
+    workerTimer=setTimeout(workerTick,100);
+  });
+  GM_registerMenuCommand('⏸ Stop worker AFTER current upload',()=>{
+    sessionStorage.removeItem(RUN_FLAG);
+    clearTimeout(workerTimer);
+    workerStatus('Stopping after any current upload');
+    alert('Auto worker disabled in this Chrome tab. Current transfer may finish.');
+  });
+  if(running()) {
+    const resume=()=>{ workerStatus('Resuming queue worker'); workerTimer=setTimeout(workerTick,1500); };
+    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',resume,{once:true});
+    else resume();
+  }
+
 })();

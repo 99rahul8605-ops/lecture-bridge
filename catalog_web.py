@@ -2,7 +2,7 @@
 import hmac
 import os
 from flask import jsonify, request
-from auto_catalog import init_db, ingest, command, mark_delivered
+from auto_catalog import init_db, ingest, command, mark_delivered, worker_next, worker_heartbeat, worker_finish
 
 
 def install_catalog_routes(app):
@@ -51,4 +51,26 @@ def install_catalog_routes(app):
         if not auth():return jsonify(error='Bad catalog key'),401
         body=request.get_json(silent=True) or {}
         try:return jsonify(updated=mark_delivered(body.get('videoId')))
+        except ValueError as exc:return jsonify(error=str(exc)),400
+
+    # Browser worker receives only lecture metadata, never CDN/DRM material.
+    @app.post('/api/catalog/worker/next')
+    def worker_next_api():
+        if not auth():return jsonify(error='Bad catalog key'),401
+        body=request.get_json(silent=True) or {}
+        try:return jsonify(worker_next(body.get('browserId')))
+        except ValueError as exc:return jsonify(error=str(exc)),400
+
+    @app.post('/api/catalog/worker/heartbeat')
+    def worker_heartbeat_api():
+        if not auth():return jsonify(error='Bad catalog key'),401
+        body=request.get_json(silent=True) or {}
+        try:return jsonify(worker_heartbeat(body.get('browserId'),body.get('videoId')))
+        except ValueError as exc:return jsonify(error=str(exc)),400
+
+    @app.post('/api/catalog/worker/finish')
+    def worker_finish_api():
+        if not auth():return jsonify(error='Bad catalog key'),401
+        body=request.get_json(silent=True) or {}
+        try:return jsonify(worker_finish(body.get('browserId'),body.get('videoId'),body.get('outcome'),body.get('error','')))
         except ValueError as exc:return jsonify(error=str(exc)),400

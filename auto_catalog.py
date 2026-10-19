@@ -13,7 +13,7 @@ from pathlib import Path
 
 ID_RE = re.compile(r'^[a-f0-9]{24}$', re.I)
 DB_PATH = Path(os.getenv('AUTO_CATALOG_DB', './chapter_data/auto_catalog.sqlite3'))
-STATES = {'pending', 'awaiting_export', 'delivered'}
+STATES = {'pending', 'awaiting_export', 'delivered', 'failed'}
 
 
 def _id(value):
@@ -80,6 +80,17 @@ def init_db():
               uid INTEGER NOT NULL, video_id TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'pending', updated INTEGER NOT NULL,
               PRIMARY KEY(uid,video_id)
+            );
+            CREATE TABLE IF NOT EXISTS worker_control (
+              uid INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS worker_active (
+              uid INTEGER PRIMARY KEY, browser_id TEXT NOT NULL,
+              video_id TEXT NOT NULL, lease_until INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS worker_attempts (
+              uid INTEGER NOT NULL, video_id TEXT NOT NULL, attempts INTEGER DEFAULT 0,
+              last_error TEXT DEFAULT '', PRIMARY KEY(uid,video_id)
             );
         ''')
 
@@ -303,27 +314,48 @@ def command(uid,cmd,arg=''):
                     'Ab /queueauto ya doosra chapter select karo. /done = queue prepare.')
         if cmd=='autopending':
             return 'yes' if db.execute("SELECT 1 FROM queue WHERE uid=? AND status='pending' LIMIT 1",(uid,)).fetchone() else 'no'
+        if cmd=='autostart':
+            db.execute('INSERT INTO worker_control(uid,enabled) VALUES(?,1) '
+                       'ON CONFLICT(uid) DO UPDATE SET enabled=1',(uid,))
+            return '▶️ Worker queue ON. Chrome par Tampermonkey Start Worker once karo.'
+        if cmd=='autostop':
+            db.execute('INSERT INTO worker_control(uid,enabled) VALUES(?,0) '
+                       'ON CONFLICT(uid) DO UPDATE SET enabled=0',(uid,))
+            return '⏸ Auto queue paused: naya lecture assign nahi hoga. Current upload may finish.'
+        if cmd=='autoretry':
+            n=db.execute("UPDATE queue SET status='awaiting_export',updated=? WHERE uid=? AND status='failed'",
+                         (int(time.time()),uid)).rowcount
+            db.execute('DELETE FROM worker_attempts WHERE uid=?',(uid,))
+            return f'🔁 {n} failed lectures requeued. /autostart for worker.'
+        if cmd=='autostatus':
+            enabled=db.execute('SELECT enabled FROM worker_control WHERE uid=?',(uid,)).fetchone()
+            job=db.execute('SELECT a.video_id, l.title, a.lease_until FROM worker_active a '
+                           'LEFT JOIN lectures l ON l.video_id=a.video_id WHERE a.uid=?',(uid,)).fetchone()
+            status=('ON' if enabled and enabled['enabled'] else 'OFF')
+            return f'🤖 Auto worker: {status}' + (f' | Working: {_clean(job["title"],70)}' if job else ' | Idle')
         if cmd=='queueauto':
             rows=db.execute('''SELECT q.status,l.title FROM queue q
                                LEFT JOIN lectures l ON l.video_id=q.video_id
                                WHERE q.uid=? ORDER BY q.updated,l.lecture_date''',(uid,)).fetchall()
             if not rows:return '📭 Auto queue empty. /add all se lectures select karo.'
             counts={k:sum(r['status']==k for r in rows) for k in STATES}
-            lines=[f'📦 Auto queue {len(rows)} | pending {counts["pending"]} | waiting export {counts["awaiting_export"]} | delivered {counts["delivered"]}']
+            lines=[f'📦 Auto queue {len(rows)} | pending {counts["pending"]} | waiting {counts["awaiting_export"]} | delivered {counts["delivered"]} | failed {counts["failed"]}']
             lines += [f'{i}. {_clean(r["title"] or "Unknown",65)} [{r["status"]}]' for i,r in enumerate(rows[:20],1)]
-            return '\n'.join(lines)+'\n/done = ready items prepare (MP4 media export separate)'
+            return '\n'.join(lines)+'\n/autostatus • /autostop • /autostart • /autoretry'
         if cmd=='autoclear':
+            db.execute('DELETE FROM worker_active WHERE uid=?',(uid,))
             c=db.execute("DELETE FROM queue WHERE uid=? AND status!='delivered'",(uid,))
             return f'🧹 {c.rowcount} pending/waiting items removed. Delivered history safe.'
         if cmd=='done':
             c=db.execute("UPDATE queue SET status='awaiting_export',updated=? WHERE uid=? AND status='pending'",
                          (int(time.time()),uid))
             still=db.execute("SELECT count(*) FROM queue WHERE uid=? AND status='awaiting_export'",(uid,)).fetchone()[0]
-            return (f'📦 {c.rowcount} newly prepared; {still} waiting authorized export.\n'
-                    '⚠️ Ye metadata queue hai, MP4 Telegram par abhi send nahi hua. '
-                    'Existing browser uploader se MP4 successful Telegram send hone ke baad '
-                    'Delivery Tracker queue ko delivered mark karega. '
-                    'Protection ko bypass ya disable nahi karta.')
+            db.execute('INSERT INTO worker_control(uid,enabled) VALUES(?,1) '
+                       'ON CONFLICT(uid) DO UPDATE SET enabled=1',(uid,))
+            return (f'📦 {c.rowcount} newly prepared; {still} waiting export.\n'
+                    '▶ Auto queue ON. Chrome mein Auto Catalog Tampermonkey > Start queue worker '
+                    'ek baar ON karo. Existing authorized uploader har lecture par trigger hoga; '
+                    'sirf real Telegram success pe delivered mark hoga.')
         return 'Unknown auto command'
 
 
@@ -340,3 +372,111 @@ def mark_delivered(video_id):
         cur=db.execute("UPDATE queue SET status='delivered',updated=? WHERE video_id=? AND status='awaiting_export'",
                        (int(time.time()),ident))
     return cur.rowcount
+
+
+# Queue worker only orchestrates existing, separate and permission-checked uploader.
+# No media URLs, CDN credentials, license requests or media payloads handled here.
+_WORKER_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{8,64}$')
+_WORKER_LEASE_SECONDS = 180
+_MAX_WORKER_ATTEMPTS = 2
+
+
+def _worker_owner():
+    owner = os.environ.get('OWNER_ID','').strip()
+    if not owner.isdecimal() or int(owner) <= 0:
+        raise ValueError('OWNER_ID must be a positive integer')
+    return int(owner)
+
+
+def _browser_id(value):
+    b = str(value or '')
+    if not _WORKER_ID_RE.fullmatch(b):
+        raise ValueError('Invalid browser identifier')
+    return b
+
+
+def _assigned_lecture(db, video_id):
+    r = db.execute('SELECT batch_id,subject_id,chapter_id,video_id,title FROM lectures WHERE video_id=?',
+                   (video_id,)).fetchone()
+    if not r:return None
+    return dict(r)
+
+
+def worker_next(browser_id):
+    'Atomically lease exactly one queued lecture to one open worker tab.'
+    browser_id=_browser_id(browser_id)
+    uid=_worker_owner()
+    now=int(time.time())
+    with _db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        enabled=db.execute('SELECT enabled FROM worker_control WHERE uid=?',(uid,)).fetchone()
+        active=db.execute('SELECT * FROM worker_active WHERE uid=?',(uid,)).fetchone()
+        # Existing upload is allowed to finish even if /autostop disabled new jobs.
+        if active and active['lease_until']>now:
+            state=db.execute('SELECT status FROM queue WHERE uid=? AND video_id=?',
+                             (uid,active['video_id'])).fetchone()
+            if state and state['status']=='awaiting_export':
+                if active['browser_id']==browser_id:
+                    details=_assigned_lecture(db,active['video_id'])
+                    if details:return {'state':'assigned','lecture':details}
+                return {'state':'busy'}
+        if active:
+            db.execute('DELETE FROM worker_active WHERE uid=?',(uid,))
+        if not enabled or not enabled['enabled']:
+            return {'state':'paused'}
+        while True:
+            r=db.execute('''SELECT q.video_id FROM queue q WHERE q.uid=? AND q.status='awaiting_export'
+                            ORDER BY q.rowid ASC LIMIT 1''',(uid,)).fetchone()
+            if not r:return {'state':'empty'}
+            video_id=r['video_id']
+            lecture=_assigned_lecture(db,video_id)
+            prior=db.execute('SELECT attempts FROM worker_attempts WHERE uid=? AND video_id=?',
+                             (uid,video_id)).fetchone()
+            if not lecture or (prior and prior['attempts']>=_MAX_WORKER_ATTEMPTS):
+                db.execute("UPDATE queue SET status='failed',updated=? WHERE uid=? AND video_id=?",
+                           (now,uid,video_id))
+                continue
+            db.execute('''INSERT INTO worker_attempts(uid,video_id,attempts) VALUES(?,?,1)
+                          ON CONFLICT(uid,video_id) DO UPDATE SET attempts=attempts+1''',
+                       (uid,video_id))
+            db.execute('INSERT INTO worker_active(uid,browser_id,video_id,lease_until) VALUES(?,?,?,?)',
+                       (uid,browser_id,video_id,now+_WORKER_LEASE_SECONDS))
+            return {'state':'assigned','lecture':lecture}
+
+
+def worker_heartbeat(browser_id,video_id):
+    browser_id=_browser_id(browser_id)
+    ident=_id(video_id)
+    if not ident:raise ValueError('Invalid video ID')
+    uid=_worker_owner()
+    with _db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        r=db.execute('''SELECT q.status FROM worker_active a JOIN queue q
+                        ON a.uid=q.uid AND a.video_id=q.video_id
+                        WHERE a.uid=? AND a.browser_id=? AND a.video_id=?''',
+                     (uid,browser_id,ident)).fetchone()
+        if not r or r['status']!='awaiting_export':return {'active':False}
+        db.execute('UPDATE worker_active SET lease_until=? WHERE uid=?',
+                   (int(time.time())+_WORKER_LEASE_SECONDS,uid))
+        return {'active':True}
+
+
+def worker_finish(browser_id,video_id,outcome,error=''):
+    browser_id=_browser_id(browser_id)
+    ident=_id(video_id)
+    if not ident:raise ValueError('Invalid video ID')
+    if outcome not in ('delivered','failed'):raise ValueError('Invalid worker outcome')
+    uid=_worker_owner()
+    with _db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        r=db.execute('SELECT * FROM worker_active WHERE uid=? AND browser_id=? AND video_id=?',
+                     (uid,browser_id,ident)).fetchone()
+        if not r:return {'updated':0,'state':'not_assigned'}
+        status='delivered' if outcome=='delivered' else 'failed'
+        changed=db.execute("UPDATE queue SET status=?,updated=? WHERE uid=? AND video_id=? AND status='awaiting_export'",
+                           (status,int(time.time()),uid,ident)).rowcount
+        if status=='failed':
+            db.execute('UPDATE worker_attempts SET last_error=? WHERE uid=? AND video_id=?',
+                       (_clean(error,250),uid,ident))
+        db.execute('DELETE FROM worker_active WHERE uid=?',(uid,))
+        return {'updated':changed,'state':status}

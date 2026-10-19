@@ -5,7 +5,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 COMMANDS={'syncstatus','batches','batch','subjects','subject','autochapters',
-          'autochapter','lectures','add','queueauto','autoclear'}
+          'autochapter','lectures','add','queueauto','autoclear','autostart','autostop','autostatus','autoretry'}
 
 
 def reply(uid,command,arg=''):
