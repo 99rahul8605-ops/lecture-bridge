@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VidCloud Auto Catalog Sync (metadata only)
 // @namespace    lecture-bridge/catalog
-// @version      2.1.0
+// @version      2.2.0
 // @description  Queue navigator follows the site's own batch/subject/chapter cards (no guessed player security fields). Existing authorised uploader unchanged.
 // @match        https://vidcloud.eu.org/*
 // @run-at       document-start
@@ -127,8 +127,33 @@
     }
     return null;
   }
+  // Batch labels are reliable ONLY inside the actual global batch search
+  // results. Elsewhere, an ancestor may carry data-batch-id while its text
+  // is the *current chapter* (which previously corrupted the catalog).
+  function batchResults() {
+    const container = document.querySelector('#globalSearchResults');
+    if (!container) return [];
+    const found = new Map();
+    for (const el of container.querySelectorAll('[data-batch-id]')) {
+      const id = el.getAttribute('data-batch-id');
+      if (!validId(id)) continue;
+      // Ignore wrappers containing results for different batches.
+      if ([...el.querySelectorAll('[data-batch-id]')].some(child =>
+        child.getAttribute('data-batch-id') !== id)) continue;
+      const name = String(el.innerText || el.textContent || '')
+        .split(/\r?\n/).map(x => x.trim()).filter(Boolean)[0] || '';
+      if (name.length < 4 || /\d+\s+lectures?\s*[|•]/i.test(name)) continue;
+      const previous = found.get(id);
+      if (!previous || name.length > previous.name.length)
+        found.set(id, {id, name: text(name,160)});
+    }
+    return [...found.values()];
+  }
   function captureClick(e) {
-    const batch = nearestWithId(e.target,['data-batch-id']);
+    const resultContainer = document.querySelector('#globalSearchResults');
+    const candidate = resultContainer && resultContainer.contains(e.target) ?
+      nearestWithId(e.target,['data-batch-id']) : null;
+    const batch = candidate && batchResults().find(b => b.id === candidate.id);
     if (batch) {
       context.batchId=batch.id;
       context.batchName=batch.name;
@@ -159,10 +184,8 @@
   }
   function scanDOM() {
     if (!document.body) return;
-    const batches=unique([...document.querySelectorAll('[data-batch-id]')].map(el=>({
-      id:el.getAttribute('data-batch-id'),
-      name:text(el.innerText || el.textContent)
-    })).filter(x => x.name.length>3));
+    // Never derive batch names from chapter/lecture page ancestors.
+    const batches=batchResults();
     if (batches.length) sync({kind:'batches',items:batches.slice(0,250)});
 
     if (!validId(context.batchId)) return;
@@ -364,6 +387,14 @@
     const batchName = String(job.batch_name || '')
       .replace(/\s+NEW\b.*$/i,'').replace(/\s+Class\s+\d.*$/i,'').trim();
     if (!input || !batchName || /^Unlabelled batch /i.test(batchName)) return false;
+    // A chapter title containing "9 Lectures | 10 Notes" is not a batch name.
+    if (/\d+\s+(?:lectures?|notes?|exercises?)\s*[|•]/i.test(batchName) ||
+        batchName === String(job.chapter_name || '').trim() ||
+        batchName === String(job.subject_name || '').trim()) {
+      workerStatus('Catalog batch label is invalid; fix the batch name before retry');
+      nextTickDelay = 6000;
+      return false;
+    }
     const modal = document.querySelector('#globalSearchModal');
     if (modal && !modal.classList.contains('active')) {
       const opener = [...document.querySelectorAll('button,[role="button"]')]
@@ -419,8 +450,27 @@
         e => /\d+\s*chapters?/i.test(e.innerText || ''));
     if (subject) return clickNative(subject,'Opening subject via website',job);
 
-    const batch = elementFor('[data-batch-id]','data-batch-id',job.batch_id);
+    const batch = elementFor('#globalSearchResults [data-batch-id]',
+      'data-batch-id',job.batch_id);
     if (batch) return clickNative(batch,'Opening batch via website',job);
+
+    // Do not type a chapter's label into the global batch-search modal when
+    // already looking at subjects, chapters or lectures. This is a state
+    // mismatch, not evidence that a different batch should be searched.
+    const courseView = [...document.querySelectorAll(
+      '#mainContent [data-video-id], #mainContent [data-subject-id], ' +
+      '#mainContent [data-topic-id], #mainContent [data-chapter-id], ' +
+      '#mainContent [data-id]'
+    )].some(el => visible(el) && (
+      el.hasAttribute('data-video-id') || el.hasAttribute('data-subject-id') ||
+      el.hasAttribute('data-topic-id') || el.hasAttribute('data-chapter-id') ||
+      /\d+\s+(?:lectures?|chapters?)\b/i.test(el.innerText || '')
+    ));
+    if (courseView) {
+      workerStatus('Course view open but target card missing; not using global batch search');
+      nextTickDelay = 5000;
+      return false;
+    }
 
     if (searchBatch(job)) return true;
     workerStatus('Waiting for normal website batch/subject UI; open batch search if needed');
