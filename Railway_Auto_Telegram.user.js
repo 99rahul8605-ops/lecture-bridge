@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.5.0
+// @version      2.6.0-retry
 // @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
@@ -17,7 +17,7 @@
  */
 (() => {
   'use strict';
-  let RELAY = 'https://upload.bingolink.site'; // Ubuntu VPS Cloudflare Tunnel
+  let RELAY = 'https://ubuntu-production-9d09.up.railway.app'; // Railway bridge (edit only if using another host)
   const WIDGET_ID = 'railway-lecture-link-v1';
   if (document.getElementById(WIDGET_ID)) return;
 
@@ -55,7 +55,7 @@
     opt.textContent = `${n} upload lane${n === 1 ? '' : 's'}`;
     lanes.appendChild(opt);
   }
-  lanes.value = '2'; // Default: test 2 vs old 1; 3 is optional.
+  lanes.value = '1'; // Stable default; switch to 2/3 only with parallel-capable server.
   const status = document.createElement('div');
   status.className = 'relay-message';
   status.hidden = true;
@@ -119,19 +119,79 @@
     return segments;
   }
 
-  async function api(path, secret, data) {
+  const RETRY_BACKOFF_MS = [2500, 7500, 20000]; // three retries, four total attempts
+  const CDN_TIMEOUT_MS = 8 * 60 * 1000;
+  const UPLOAD_TIMEOUT_MS = 8 * 60 * 1000;
+
+  function shouldRetry(error) {
+    if (error && error.transient) return true;
+    const code = Number(error && error.httpStatus);
+    return [408, 425, 429, 500, 502, 503, 504].includes(code) ||
+      (code === 409 && /still in progress|duplicate segment/i.test(error.message || ''));
+  }
+
+  async function retrySegment(label, doAttempt, onRetry) {
+    for (let attempt = 0; ; attempt++) {
+      try { return await doAttempt(); }
+      catch (error) {
+        if (attempt >= RETRY_BACKOFF_MS.length || !shouldRetry(error)) throw error;
+        onRetry(attempt + 1, RETRY_BACKOFF_MS.length, error);
+        await wait(RETRY_BACKOFF_MS[attempt]);
+      }
+    }
+  }
+
+  async function fetchSegment(segmentUrl, index) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CDN_TIMEOUT_MS);
+    try {
+      let res;
+      try { res = await fetch(segmentUrl, {mode:'cors', credentials:'same-origin', signal:controller.signal}); }
+      catch (error) {
+        const err = new Error(`CDN segment ${index + 1} fetch failed: ${error.message}`);
+        err.transient = true;
+        throw err;
+      }
+      if (!res.ok) {
+        const err = new Error(`CDN segment ${index + 1} HTTP ${res.status}`);
+        err.httpStatus = res.status;
+        throw err;
+      }
+      try { return await res.arrayBuffer(); }
+      catch (error) {
+        const err = new Error(`CDN segment ${index + 1} body failed: ${error.message}`);
+        err.transient = true;
+        throw err;
+      }
+    } finally { clearTimeout(timeout); }
+  }
+
+  async function api(path, secret, data, timeoutMs = 120000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const options = {
-      method: 'POST',
+      method: 'POST', signal: controller.signal,
       headers: {...(secret ? {'X-Relay-Key': secret} : {}), 'Content-Type': data instanceof ArrayBuffer
         ? 'application/octet-stream' : 'application/json'},
       body: data instanceof ArrayBuffer ? data : JSON.stringify(data)
     };
     let response;
-    try { response = await fetch(RELAY + path, options); }
-    catch (e) { throw new Error('Railway API unreachable (deploy, CORS, or website CSP): ' + e.message); }
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(`Railway ${response.status}: ${body.error || 'API failed'}`);
-    return body;
+    try {
+      try { response = await fetch(RELAY + path, options); }
+      catch (error) {
+        const err = new Error(`Relay request ${path.includes('/segment/') ? 'segment' : 'API'} failed: ${error.message}`);
+        err.transient = true;
+        throw err;
+      }
+      let body;
+      try { body = await response.json(); } catch (_) { body = {}; }
+      if (!response.ok) {
+        const err = new Error(`Relay HTTP ${response.status}: ${body.error || 'API failed'}`);
+        err.httpStatus = response.status;
+        throw err;
+      }
+      return body;
+    } finally { clearTimeout(timer); }
   }
 
   async function poll(jobId, key) {
@@ -222,9 +282,13 @@
           const downloadBegan = performance.now();
           try {
             try {
-              const response = await fetch(segments[i], {mode: 'cors', credentials: 'same-origin'});
-              if (!response.ok) throw new Error(`Video segment ${i + 1} HTTP ${response.status}`);
-              data = await response.arrayBuffer();
+              data = await retrySegment(`CDN segment ${i + 1}`,
+                () => fetchSegment(segments[i], i),
+                (attempt, limit, error) => {
+                  lane.phase = `retry CDN ${attempt}/${limit}`;
+                  say(`Retrying CDN segment ${i + 1} (${attempt}/${limit}): ${error.message}`);
+                  renderStats();
+                });
               if (i === 0) {
                 const x = new Uint8Array(data);
                 if (x.length < 189 || x[0] !== 0x47 || x[188] !== 0x47)
@@ -242,7 +306,13 @@
             renderStats();
             const uploadBegan = performance.now();
             try {
-              await api(`/api/relay/${encodeURIComponent(job.job_id)}/segment/${i}`, key, data);
+              await retrySegment(`Railway segment ${i + 1}`,
+                () => api(`/api/relay/${encodeURIComponent(job.job_id)}/segment/${i}`, key, data, UPLOAD_TIMEOUT_MS),
+                (attempt, limit, error) => {
+                  lane.phase = `retry upload ${attempt}/${limit}`;
+                  say(`Retrying VPS upload segment ${i + 1} (${attempt}/${limit}): ${error.message}`);
+                  renderStats();
+                });
               uploaded++;
               uploadBytes += data.byteLength;
               lane.uploadRate = rate(data.byteLength, performance.now() - uploadBegan);
