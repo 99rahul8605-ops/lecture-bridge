@@ -1,53 +1,62 @@
-# Lecture Segment Retry v2.6 — Railway / Ubuntu VPS
+# Video 1 Railway upload complete -> Video 2 start while Video 1 sends to Telegram
 
-This patch is for the existing **one-click Send MP4 to Telegram** relay. It does not perform DRM decryption or bypass website/CDN authorization. Use it only for media you are authorized to export.
+## Kya change hota hai
 
-## What is fixed
+- **Browser:** saare valid, permitted HLS segments send karke `/finish` ke 202 response par instantly free. Ab Telegram ke final `sent` status ko poll/wait nahi karega. **Next lecture manually open** karke one-click Send dabaa sakte ho.
+- **Server:** `RELAY_MAX_JOBS=1` ab **sirf active browser upload** limit karta hai. Background `queued`/`processing`/`telegram_sending` upload slot occupy nahi karte.
+- **Telegram:** processing aur Telegram send **ek-ek karke** hote hain, jisse Pyrogram/Telethon session conflict aur FFmpeg overload avoid hota hai. Telegram group ka existing per-video progress notifier unchanged.
+- **Safety:** `RELAY_BACKGROUND_JOBS=2` by default. 2 completed jobs queue mein hain toh naya `/start` 429 dega, taaki disk/RAM exhaust na hon. Disk ka kam-se-kam 512 MiB free check hota hai. Old upload retry/parallel lanes and MP4 conversion untouched.
+- **One worker** Gunicorn configuration wahi rahegi.
 
-- One stuck CDN segment GET or browser→bridge POST is no longer allowed to wait forever: **8-minute timeout per attempt**.
-- Transient network errors, HTTP 408/425/429/5xx: **up to 3 retries**, wait 2.5 s, 7.5 s, 20 s.
-- **No retry** on HTTP 401/403/413, because those require fixing authorization/size instead.
-- Railway receives a safe idempotent ACK if an earlier segment POST was committed but the response was lost. The same segment is **not appended twice**.
-- 1, 2, 3 lane selections remain; **default 1** for stability. MP4 conversion and Telegram upload unchanged.
-- The browser shows retries in the progress panel. Download/upload averages still reflect completion, not real-time byte counters.
+## Install
 
-## Install: currently active Railway server
+1. **Wait until the current video finishes Telegram sending**, because Gunicorn reload kills RAM-based background jobs.
+2. ZIP ko extract karo. Saari files GitHub `lecture-bridge` repo ke root mein upload karo; `tests/fixtures/` folders bhi preserve karo.
+3. Railway Ubuntu (ya same `lecture-bridge` VPS) terminal:
 
-**Do not install/reload while a video upload is active.** A stuck old upload cannot resume automatically after a page reload. If it is irrecoverably pending, reload the player to stop browser work, and let stale job cleanup release the previous server job slot before starting the new test.
+```bash
+cd /lecture-bridge         # VPS par ho sakta hai cd ~/lecture-bridge
+# Agar ZIP files GitHub par uploaded hain:
+git pull --ff-only
+bash deploy_pipeline.sh
+```
 
-1. Extract ZIP and upload these two files to **the same GitHub `lecture-bridge` repository**:
-   - `Railway_Auto_Telegram.user.js`
-   - `install_retry_backend.py`
-2. On Railway Ubuntu terminal:
+Installer `relay_api.py.before-pipeline-<timestamp>` backup banata hai aur existing code ko hi patch karta hai. Script pehle 6 offline tests chalata hai; `RELOAD` ke liye prompt karega. **Tabhi RELOAD type karna jab koi existing Telegram send/FFmpeg/upload running na ho.**
+
+4. Chrome **Tampermonkey** mein ek hi `Lecture Auto Send to Telegram` userscript rakhna; is package wala `Railway_Auto_Telegram.user.js` replace karo. Agar VPS use kar rahe ho toh script ki `let RELAY` line VPS domain set karo; Railway ka default already set hai.
+5. Lecture page reload karo. **Video 1: Send MP4 to Telegram**. All segments uploaded message ke baad next video kholkar **Video 2: Send** dabao. Video 1 ka processing + Telegram send background mein rahega. Telegram group mein delivery/progress dekho.
+
+## Expected sequence
+
+```
+Video 1: Browser upload 25/25 ✅ -> /finish 202 (queued)
+                         Telegram Video 1: converting -> sending -> sent
+Video 2: Browser upload 25/25 ✅ -----------------------^
+Video 2 Telegram: queued until Video 1 completes, then converting -> sending -> sent
+```
+
+**Important:** Jo /finish 202 batata hai, woh *server ne saare segments receive kiye hain* ki confirmation hai, **Telegram delivered** ki nahi. Browser band kar sakte ho, lekin Railway/VPS worker running rehna chahiye. In-process background jobs deployment/restart ke baad automatically resume nahi honge.
+
+## Limitations
+
+- Existing network `Failed to fetch`, slow uploads, short CDN session, CORS, Cloudflare connectivity is change se fix nahi hote.
+- Server ki free disk zaroori hai: media input aur conversion output dono temporary jagah lete hain.
+- DRM/signature bypass or key generation is package ka part nahi hai. Existing authorized media handling unchanged.
+- Existing Telethon/Pyrogram sender ka function unchanged hai.
+- Railway aur user ke browser par live upload/delivery test nahi chalaya gaya; offline simulations pass hue hain.
+
+## Rollback
+
+Jab jobs idle hon:
 
 ```bash
 cd /lecture-bridge
-git pull --ff-only
-python3 install_retry_backend.py relay_api.py
+ls -t relay_api.py.before-pipeline-* | head -1
+cp "$(ls -t relay_api.py.before-pipeline-* | head -1)" relay_api.py
 python3 -m py_compile relay_api.py
+# Ab running Gunicorn master ka PID check karke HUP; manually:
 ps -eo pid,ppid,args | grep '[g]unicorn.*8090'
+# kill -HUP <MASTER_PID>
 ```
 
-3. Identify the Gunicorn **master PID**: it is the process whose parent is SCREEN and which has a child Gunicorn worker. After ongoing transfers are finished, reload only that master:
-
-```bash
-kill -HUP YOUR_MASTER_PID
-sleep 3
-curl -sS http://127.0.0.1:8090/health
-```
-
-   **Do not** use `kill -9` or `fuser -k` just to reload code. The installer makes a timestamped `relay_api.py.retry-backup-*` file.
-
-4. In Chrome Tampermonkey **replace the current** `Lecture Auto Send to Telegram` userscript with this v2.6 file (disable any duplicates). Its default domain is `https://ubuntu-production-9d09.up.railway.app`; edit only if using another server. Save, reload lecture player.
-5. Start **one new upload with 1 lane**. Watch for `Retrying CDN segment #` or `Retrying VPS upload segment #`. If this succeeds, later try 2 lanes if Railway has parallel-capable relay_api.py.
-
-## If you are using VPS instead
-
-Same install steps in `~/lecture-bridge`, but set `RELAY` in the userscript to your HTTPS VPS hostname and reload the VPS Gunicorn master.
-
-## Limits
-
-- A new script version cannot attach to/continue a stuck upload already running in the old script.
-- The server must be patched too for safe retries after **lost upload acknowledgements**. Without the server patch, duplicate 409 errors may still fail.
-- Retrying does not fix blocked authorization, unavailable CDN links, a broken Cloudflare tunnel, or insufficient upstream bandwidth.
-- Python and JavaScript syntax and offline mock scenarios are tested; no live authenticated site / Railway / Telegram end-to-end test was run here.
+Tampermonkey mein pichhla uploader restore kar dena. `.env`, tunnel, credentials, queue catalog aur doosre bots change nahi hote.

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.6.0-retry
-// @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
+// @version      2.7.0-background-next
+// @description  Send one authorized lecture to relay, then immediately free browser for the next while Telegram sends in background.
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
 // @grant        none
@@ -338,9 +338,13 @@
       if (failure) throw failure;
       await api(`/api/relay/${encodeURIComponent(job.job_id)}/finish`, key, {});
       transferFinished = true;
-      say('All segments uploaded. Railway converting to MP4…');
-      const result = await poll(job.job_id, key);
-      say(`✅ Sent to Telegram: ${result.title}.mp4 (check your bot chat)`);
+      // /finish returns only when the server has accepted all segments.
+      // Conversion and Telegram delivery continue in the relay worker after
+      // the browser navigates away. The Telegram group gets live progress.
+      say(`✅ ${title}: all ${segments.length} segments safely uploaded. ` +
+          'MP4 conversion + Telegram sending is running in background. ' +
+          'You can open the NEXT lecture now; watch Telegram group for final delivery.');
+      console.info('[Lecture bridge] background job accepted:', job.job_id);
     } catch (e) {
       // Free the server job slot on a failed browser upload.
       // Never cancel once conversion or Telegram delivery has started.
