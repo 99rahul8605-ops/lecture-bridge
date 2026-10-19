@@ -82,27 +82,28 @@ class CloudTests(unittest.TestCase):
             with patch.object(cloud,'_fetch_bytes',return_value=data):
                 with self.assertRaises(cloud.CloudError):cloud._get_playlist(VALID)
     @unittest.skipUnless(HAVE_FLASK, "Flask not installed in offline build container")
-    def test_auth_and_enqueue_duplicate_and_status_no_url_leak(self):
+    def test_no_key_enqueue_duplicate_and_status_no_url_leak(self):
         cloud._started=True
         app=Flask(__name__)
         cloud.install_cloud_routes(app)
         client=app.test_client()
         data={'manifest':VALID,'videoId':'lecture_987','title':'Lecture 4'}
-        self.assertEqual(client.post('/api/cloud/enqueue',json=data).status_code,401)
-        with patch.object(cloud,'_secret',return_value='A'*36):
-            headers={'X-Cloud-Queue-Key':'A'*36, 'Origin':'https://vidcloud.eu.org'}
-            first=client.post('/api/cloud/enqueue',json=data,headers=headers)
-            self.assertEqual(first.status_code,201)
-            second=client.post('/api/cloud/enqueue',json=data,headers=headers)
-            self.assertEqual(second.status_code,200)
-            self.assertTrue(second.json['duplicate'])
-            self.assertNotIn('Policy',str(first.json))
-            stats=client.get('/api/cloud/queue',headers=headers)
-            self.assertEqual(stats.json['jobs'][0]['state'],'waiting')
-            self.assertEqual(stats.json['jobs'][0]['title'],'Lecture 4')
-            self.assertNotIn('manifest',str(stats.json))
-            denied=client.post('/api/cloud/enqueue',json={**data,'videoId':'lecture_988','manifest':'http://127.0.0.1/'},headers=headers)
-            self.assertEqual(denied.status_code,400)
+        first=client.post('/api/cloud/enqueue',json=data,headers={'Origin':'https://vidcloud.eu.org'})
+        self.assertEqual(first.status_code,201)
+        second=client.post('/api/cloud/enqueue',json=data)
+        self.assertEqual(second.status_code,200)
+        self.assertTrue(second.json['duplicate'])
+        self.assertNotIn('Policy',str(first.json))
+        stats=client.get('/api/cloud/queue')
+        self.assertEqual(stats.status_code,200)
+        self.assertEqual(stats.json['jobs'][0]['state'],'waiting')
+        self.assertEqual(stats.json['jobs'][0]['title'],'Lecture 4')
+        self.assertNotIn('manifest',str(stats.json))
+        denied=client.post('/api/cloud/enqueue',json={**data,'videoId':'lecture_988','manifest':'http://127.0.0.1/'})
+        self.assertEqual(denied.status_code,400)
+        bad_dns='https://'+cloud.HOST+'/x'
+        with patch.object(cloud.socket,'getaddrinfo',return_value=[(2,1,6,'',('127.0.0.1',443))]):
+            self.assertEqual(client.post('/api/cloud/enqueue',json={**data,'videoId':'lecture_989','manifest':bad_dns}).status_code,400)
     def test_segment_streaming_and_bound(self):
         payload=b'G'*376
         class Response(io.BytesIO):

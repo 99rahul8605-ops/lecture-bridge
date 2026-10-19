@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Idempotent local installer: progress cleanup + cloud queue registration + cloud key.
+"""Idempotent local installer: progress cleanup + public cloud queue registration.
 
 Called by setup_deploy.sh after tests and idle confirmation. Nothing deployed
 remotely without the user's own git pull / local terminal action.
 """
 import ast
 from datetime import datetime, timezone
-import os
 from pathlib import Path
-import secrets
 import sys
 
 from install_progress_cleanup import patch_text
@@ -42,13 +40,6 @@ def install(root, build_mode=False):
                 path.write_text(content)
                 print('Docker build patched:',path.name)
         return []
-    # Key file lives with queue data, not public GitHub. Save Railway env var if possible.
-    queue_dir=Path(os.getenv('CLOUD_QUEUE_DIR') or (os.getenv('RELAY_DATA_DIR','/tmp/lecture_relay')+'/cloud_queue'))
-    queue_dir.mkdir(parents=True,exist_ok=True)
-    key_file=queue_dir/'cloud_queue.key'
-    if not os.getenv('CLOUD_QUEUE_KEY') and not key_file.exists():
-        fd=os.open(str(key_file),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-        with os.fdopen(fd,'w') as f:f.write(secrets.token_urlsafe(32)+'\n')
     # Backups for both code files, before any mutation.
     stamp=datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
     changed=[]
@@ -64,12 +55,7 @@ def install(root, build_mode=False):
     except Exception:
         for path in changed:path.write_text(originals[path])
         raise
-    if os.getenv('CLOUD_QUEUE_KEY') and len(os.getenv('CLOUD_QUEUE_KEY'))>=24:
-        print('Cloud key: using configured CLOUD_QUEUE_KEY env var (not printing secret).')
-    else:
-        print('\nIMPORTANT — PRIVATE Cloud Queue Key (paste only into Tampermonkey prompt, NOT GitHub):')
-        print(key_file.read_text().strip() if key_file.exists() else '[no key: configure CLOUD_QUEUE_KEY]')
-        print('Key file:',key_file)
+    print('Cloud Queue API is PUBLIC (no key/authentication). Keep Railway URL private if possible.')
     print('Railway volume recommended: mount /data; set CLOUD_QUEUE_DIR=/data/lecture_cloud')
     return changed
 

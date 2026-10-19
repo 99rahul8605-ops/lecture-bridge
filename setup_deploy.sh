@@ -12,6 +12,7 @@ echo '[1/4] Dependencies + offline tests'
 command -v ffmpeg >/dev/null || { echo 'ffmpeg missing'; exit 1; }
 python3 -c 'import flask; import relay_api' || { echo 'Missing Flask or backend; activate your existing venv'; exit 1; }
 python3 test_cloud_queue.py
+python3 test_nokey_public_smoke.py
 python3 test_progress_cleanup.py
 echo '[2/4] Safety: no browser upload, FFmpeg job or Telegram send should be active.'
 read -r -p 'When all transfers are IDLE, type IDLE to install and reload: ' answer
@@ -19,6 +20,7 @@ if [[ "$answer" != 'IDLE' ]]; then echo 'Cancelled; no changes'; exit 2; fi
 python3 one_command_deploy.py
 python3 -m py_compile app.py relay_api.py cloud_queue.py
 python3 test_cloud_queue.py
+python3 test_nokey_public_smoke.py
 echo '[3/4] Reloading the existing SINGLE Gunicorn service if unambiguous'
 python3 - <<'PY'
 import os,signal,subprocess

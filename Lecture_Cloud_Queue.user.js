@@ -1,19 +1,18 @@
 // ==UserScript==
 // @name         Lecture Cloud Queue (PC OFF Pilot)
 // @namespace    lecture-bridge-cloud
-// @version      1.0.0
-// @description  Queue authorized unencrypted HLS VOD streams for Railway-side download, conversion and Telegram; no DRM/session bypass.
+// @version      1.0.3
+// @description  Public no-key cloud queue for authorized unencrypted HLS; browser permissions and HTTP diagnostics.
 // @match        https://vidcloud.eu.org/index.php*
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
-// @grant        GM_getValue
-// @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @connect      ubuntu-production-c8d8.up.railway.app
 // ==/UserScript==
 (() => {
   'use strict';
-  const RELAY = 'https://ubuntu-production-9d09.up.railway.app';
+  const RELAY = 'https://ubuntu-production-c8d8.up.railway.app';
   const HOST = 'bunny-cdn-qbg-s6.testwave.cc';
-  const TOKEN_NAME = 'lecture-cloud-queue-access-key';
   const panel = document.createElement('div');
   panel.id = 'lecture-cloud-queue-panel';
   panel.style.cssText = 'position:fixed!important;bottom:12px!important;right:12px!important;z-index:2147483646!important;box-sizing:border-box!important;width:min(360px,94vw)!important;max-height:45vh!important;overflow-y:auto!important;border-radius:12px!important;border:1px solid #4485b7!important;background:#142234!important;color:#f0f7ff!important;padding:12px!important;box-shadow:0 4px 18px #0008!important;font:12px/1.5 system-ui!important;';
@@ -39,26 +38,40 @@
   (document.body||document.documentElement).appendChild(panel);
   const say = text => {status.textContent=text;};
 
-  function key(ask=true) {
-    let value=GM_getValue(TOKEN_NAME,'');
-    if (!value && ask) {
-      const input=prompt('Railway setup_deploy.sh ke output se CLOUD QUEUE KEY paste karo (Telegram BOT_TOKEN nahi).');
-      if (input && input.trim().length>=24) {
-        value=input.trim();GM_setValue(TOKEN_NAME,value);
-      }
+  function api(path, method='GET', payload=null) {
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      return Promise.reject(new Error('Tampermonkey GM_xmlhttpRequest permission unavailable. Script update karo aur @connect allow karo.'));
     }
-    return value;
-  }
-  async function api(path, method='GET', payload=null) {
-    const k=key(method!=='GET');
-    if (!k) throw new Error('Cloud queue key set karo: Change Key button.');
-    const response=await fetch(RELAY + path, {
-      method, headers: {'X-Cloud-Queue-Key':k, ...(payload?{'Content-Type':'application/json'}:{})},
-      ...(payload?{body:JSON.stringify(payload)}:{})
+    return new Promise((resolve,reject)=>{
+      GM_xmlhttpRequest({
+        method,
+        url: RELAY + path,
+        timeout: 20000,
+        headers: {
+          'Accept': 'application/json',
+          ...(payload?{'Content-Type':'application/json'}:{})
+        },
+        ...(payload?{data:JSON.stringify(payload)}:{}),
+        onload: response=>{
+          let data={};
+          try {data=JSON.parse(response.responseText || '{}');}
+          catch (_) {data={};}
+          if (response.status >= 200 && response.status < 300) {
+            resolve(data);
+          } else {
+            const hint=response.status===404
+              ? 'Cloud Queue backend route missing. Railway deploy check karo.'
+              : response.status===401
+                ? 'Railway still requires a key: deploy no-key cloud_queue.py backend.'
+                : (data.error || `Unexpected Railway response (${response.status||'no HTTP status'})`);
+            reject(new Error(`Railway HTTP ${response.status||0}: ${hint}`));
+          }
+        },
+        ontimeout: ()=>reject(new Error('Railway API timed out (20s). Railway service/network check karo.')),
+        onerror: ()=>reject(new Error('Tampermonkey cannot reach the Railway domain. Confirm @connect permission for ubuntu-production-c8d8.up.railway.app and verify the new Railway domain API is live.')),
+        onabort: ()=>reject(new Error('Railway request was aborted.'))
+      });
     });
-    const data=await response.json().catch(()=>({}));
-    if (!response.ok) throw new Error(`Railway HTTP ${response.status}: ${data.error||'Request failed'}`);
-    return data;
   }
   function foundManifest() {
     const matches=performance.getEntriesByType('resource')
@@ -105,16 +118,12 @@
       }
       if(!persistent) say('⚠️ Cloud Queue storage volume not configured; Railway restart par queue lose ho sakti hai.');
     } catch(err) {
-      if(key(false)) say('Status unavailable: '+err.message);
+      say('Status unavailable: '+err.message);
     }
   }
   makeButton('☁ Add this lecture',add);
   makeButton('↻ Refresh stats',refresh);
-  makeButton('🔑 Change Key',()=>{
-    const value=prompt('New CLOUD_QUEUE_KEY (Telegram BOT_TOKEN nahi):');
-    if(value && value.trim().length>=24){GM_setValue(TOKEN_NAME,value.trim());say('Key updated');refresh();}
-  });
   say('Cloud mode: har lecture par Play → Pause → ☁ Add. Railway accepted hone ke baad PC OFF possible hai, provided CDN allows access.');
-  if(key(false)) refresh();
-  setInterval(()=>{if(key(false))refresh();},10000);
+  refresh();
+  setInterval(refresh,10000);
 })();
