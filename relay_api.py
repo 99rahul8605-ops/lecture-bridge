@@ -43,7 +43,92 @@ UPLOAD_IDLE_SECONDS = int(
 )
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
+# PIPELINE_UPLOAD_NEXT_V1
+MAX_BACKGROUND_JOBS = max(1, min(4, int(os.environ.get("RELAY_BACKGROUND_JOBS", "2"))))
+_conversion_lock = threading.Lock()
 
+
+
+# LECTURE_RESUME_CACHE_V1
+# Keep resumable upload segments for up to 48 hours if disk space permits.
+RESUME_TTL_SECONDS = max(3600, min(7 * 86400, int(float(os.getenv("RELAY_RESUME_TTL_HOURS", "48")) * 3600)))
+
+def _save_resume(job_id: str, job: dict[str, Any]) -> None:
+    if not job.get("resume_key"):
+        return
+    # File is never a source for URLs, cookies or DRM data.
+    payload = {
+        "job_id": job_id, "resume_key": job["resume_key"],
+        "source_fingerprint": job["source_fingerprint"],
+        "expected": job["expected"], "title": job["title"],
+        "created": job["created"], "updated": job["updated"],
+        "next": job["next"], "received": sorted(job["received"]),
+        "bytes": job["bytes"], "status": job["status"],
+        "prefix_bytes": (job["folder"] / "input.ts").stat().st_size
+            if (job["folder"] / "input.ts").is_file() else 0,
+    }
+    temporary = job["folder"] / "resume.json.tmp"
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, job["folder"] / "resume.json")
+
+
+def _restore_resumable_jobs() -> None:
+    # Imported once by the single Gunicorn worker. Verify committed input length
+    # and waiting indexed TS files before reusing on-disk state.
+    for manifest in ROOT.glob("*/resume.json"):
+        try:
+            obj = json.loads(manifest.read_text(encoding="utf-8"))
+            folder = manifest.parent
+            jid = obj["job_id"]
+            if folder.name != jid or not re.fullmatch(r"[A-Za-z0-9_-]{12,64}", jid):
+                continue
+            if obj.get("status") not in ("paused", "uploading", "queued", "processing", "telegram_sending", "sent"):
+                continue
+            if time.time() - float(obj["updated"]) > RESUME_TTL_SECONDS:
+                continue
+            count = int(obj["expected"])
+            nxt = int(obj["next"])
+            received = set(int(i) for i in obj["received"])
+            if not (1 <= count <= 10000 and 0 <= nxt <= count and
+                    all(0 <= i < count for i in received) and
+                    all(i in received for i in range(nxt))):
+                continue
+            ts = folder / "input.ts"
+            if obj["status"] in ("uploading", "paused") and (
+                (ts.stat().st_size if ts.is_file() else 0) != int(obj.get("prefix_bytes", -1))):
+                continue
+            # For already-queued/sending/sent videos the FFmpeg input may have
+            # been intentionally deleted, but the tombstone must remain to avoid
+            # delivering a duplicate MP4 after an acknowledged upload.
+            if obj["status"] in ("uploading", "paused"):
+                if nxt > 0 and (not ts.is_file() or ts.stat().st_size == 0):
+                    continue
+                if any(not (folder / "segments" / f"{i:06d}.ts").is_file()
+                       for i in received if i >= nxt):
+                    continue
+            fingerprint = obj.get("source_fingerprint", "")
+            resume_key = obj.get("resume_key", "")
+            # Interrupted request temporary files are never accepted/cache hits.
+            if obj["status"] in ("uploading", "paused"):
+                for part in (folder / "segments").glob("*.part"):
+                    part.unlink(missing_ok=True)
+            if not (re.fullmatch(r"[a-f0-9]{64}", fingerprint) and
+                    re.fullmatch(r"[a-zA-Z0-9_-]{20,100}", resume_key)):
+                continue
+            job = {"folder": folder, "created": float(obj["created"]),
+                   "updated": float(obj["updated"]), "status": (
+                       "paused" if obj["status"] in ("paused", "uploading")
+                       else obj["status"]),
+                   "expected": count, "next": nxt, "bytes": int(obj["bytes"]),
+                   "inflight_bytes": 0, "inflight": set(), "received": received,
+                   "received_count": len(received), "title": str(obj["title"])[:140],
+                   "download_token": secrets.token_urlsafe(24), "lock": threading.Lock(),
+                   "resume_key": resume_key, "source_fingerprint": fingerprint}
+            _jobs[jid] = job
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            log.warning("Skipped corrupt cached upload state (%s)", type(exc).__name__)
+
+_restore_resumable_jobs()
 
 def _allowed_origin() -> str:
     return os.environ.get("RELAY_ALLOWED_ORIGIN", "https://vidcloud.eu.org").rstrip("/")
@@ -69,14 +154,11 @@ def _job(job_id: str):
 
 
 def _reap_abandoned_uploads():
-    """Reclaim idle uploads only; never touch conversion or Telegram sending.
-
-    A nonblocking job lock prevents deleting files during a segment write.
-    """
+    """Paused cached jobs release browser slot, WITHOUT deleting received bytes."""
     now = time.time()
     folders = []
     with _jobs_lock:
-        for job_id, job in list(_jobs.items()):
+        for jid, job in list(_jobs.items()):
             if job["status"] != "uploading" or job.get("inflight"):
                 continue
             if now - job.get("updated", job["created"]) <= UPLOAD_IDLE_SECONDS:
@@ -84,10 +166,15 @@ def _reap_abandoned_uploads():
             if not job["lock"].acquire(blocking=False):
                 continue
             try:
-                if (job["status"] == "uploading" and not job.get("inflight") and
-                        now - job.get("updated", job["created"]) > UPLOAD_IDLE_SECONDS):
+                if job["status"] != "uploading" or job.get("inflight"):
+                    continue
+                if job.get("resume_key"):
+                    job["status"] = "paused"
+                    job["updated"] = now
+                    _save_resume(jid, job)
+                else:
                     job["status"] = "expired"
-                    _jobs.pop(job_id, None)
+                    _jobs.pop(jid, None)
                     folders.append(job["folder"])
             finally:
                 job["lock"].release()
@@ -95,24 +182,24 @@ def _reap_abandoned_uploads():
         shutil.rmtree(folder, ignore_errors=True)
     return len(folders)
 
-
 def _purge_loop():
     while True:
         time.sleep(30)
         _reap_abandoned_uploads()
-        current = time.time()
+        now = time.time()
         folders = []
         with _jobs_lock:
-            expired = [key for key, job in _jobs.items()
-                       if job["status"] in ("sent", "failed", "cancelled")
-                       and current - job.get("updated", job["created"]) > TTL_SECONDS]
-            for key in expired:
-                job = _jobs.pop(key)
-                folders.append(job["folder"])
+            for jid, job in list(_jobs.items()):
+                if job.get("inflight"):
+                    continue
+                state = job["status"]
+                age = now - job.get("updated", job["created"])
+                if (state == "paused" and age > RESUME_TTL_SECONDS) or (
+                    state in ("sent", "failed", "cancelled") and age > TTL_SECONDS):
+                    _jobs.pop(jid, None)
+                    folders.append(job["folder"])
         for folder in folders:
             shutil.rmtree(folder, ignore_errors=True)
-
-
 
 def _bot_api(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """Telegram Bot API is only used for editing progress text messages.
@@ -149,6 +236,8 @@ def _progress_text(job: dict[str, Any]) -> str:
         return (f"{header}\n\n⬇️ Download + Railway upload: {received}/{expected} segments ({progress_pct}%)"
                 f"\n📦 {uploaded_mib:.1f} MiB received • {rate:.2f} MiB/s"
                 "\n⏳ Chrome tab khula rakho")
+    if stage == "queued":
+        return f"{header}\n\n✅ All segments on server; waiting for Telegram turn."
     if stage == "processing":
         return (f"{header}\n\n✅ Railway upload: {expected}/{expected} segments"
                 f"\n🎞️ Converting to MP4… ({int(elapsed)}s elapsed)")
@@ -172,47 +261,52 @@ def _progress_text(job: dict[str, Any]) -> str:
     return f"{header}\n\n⏳ Processing…"
 
 
-def _progress_notifier(job: dict[str, Any]) -> None:
-    """One Telegram message per job, edited at a safe, throttled interval.
+# LECTURE_BOT_PROGRESS_CLEANUP_V1
 
-    Failing to send progress must never abort a video transfer.
-    """
+def _progress_notifier(job: dict[str, Any]) -> None:
+    """Only edit/delete the own temporary progress text; never Telegram video."""
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
         return
     message_id = None
     last_message = None
-    last_edit_at = 0.0
-    last_attempt_at = 0.0
-    final_states = {"sent", "failed", "expired", "cancelled"}
+    last_at = -float("inf")
+    terminal = {"paused", "expired", "cancelled", "failed", "sent"}
     while True:
-        state = job["status"]
+        state = job.get("status", "uploading")
+        if state in terminal:
+            if message_id is not None:
+                # On pause/expiration: remove status immediately. No spam saying
+                # 'Upload expired; job slot released' in the group.
+                if state == "failed":
+                    time.sleep(10)
+                elif state == "sent":
+                    time.sleep(3)
+                for attempt in range(3):
+                    try:
+                        _bot_api("deleteMessage", {"chat_id": chat_id,
+                                                   "message_id": message_id})
+                        break
+                    except Exception as exc:
+                        log.warning("Temporary progress delete failed (%s)", type(exc).__name__)
+                        if attempt < 2:
+                            time.sleep(2)
+            return
         text = _progress_text(job)
         now = time.monotonic()
-        if text != last_message and now - last_attempt_at >= PROGRESS_INTERVAL:
-            last_attempt_at = now
+        if text != last_message and now - last_at >= PROGRESS_INTERVAL:
+            last_at = now
             try:
                 if message_id is None:
-                    result = _bot_api("sendMessage", {"chat_id": chat_id, "text": text,
-                                                      "disable_web_page_preview": "true"})
-                    message_id = result["message_id"]
-                elif now - last_edit_at >= PROGRESS_INTERVAL:
-                    _bot_api("editMessageText", {"chat_id": chat_id,
-                                                  "message_id": message_id, "text": text})
-                    last_edit_at = time.monotonic()
+                    message_id = _bot_api("sendMessage", {"chat_id": chat_id,
+                        "text": text, "disable_web_page_preview": "true"})["message_id"]
                 else:
-                    time.sleep(1)
-                    continue
+                    _bot_api("editMessageText", {"chat_id": chat_id,
+                        "message_id": message_id, "text": text})
                 last_message = text
             except Exception as exc:
-                # Do not expose tokens or message text to logs.
-                log.warning("Telegram progress notification failed (%s)", type(exc).__name__)
-        if state in final_states:
-            # If a final update was throttled, wait and edit it once before exiting.
-            if last_message == text or message_id is None:
-                return
+                log.warning("Temporary progress update failed (%s)", type(exc).__name__)
         time.sleep(2)
-
 
 def _telegram_setup_error() -> str | None:
     if not (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")):
@@ -311,7 +405,6 @@ def _telegram_caption(title: str, meta: dict[str, Any], size: int) -> str:
             f"📺 {meta['width']}×{meta['height']}  •  MP4")
 
 
-
 # LECTURE_SITE_THUMB_V1: keep original website thumbnail as Telegram video cover.
 def _lecture_site_thumbnail(job, file_path, duration):
     """Use only allowlisted public HTTPS thumbnail origins; fallback to video frame."""
@@ -363,6 +456,11 @@ async def _telegram_send(job: dict[str, Any], file_path: Path):
     Modelled after the original downloader bot's tl_send() logic. Progress
     callback remains compatible with Telegram live progress message editing.
     """
+    # PYROGRAM_SENDER_SWITCH_V1
+    if os.getenv("TELEGRAM_SENDER", "pyrogram").strip().lower() == "pyrogram":
+        from relay_sender_pyrogram import send_telegram_mp4
+        return await send_telegram_mp4(job, file_path)
+
     from telethon import TelegramClient
     from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 
@@ -418,6 +516,17 @@ async def _telegram_send(job: dict[str, Any], file_path: Path):
 
 
 def _convert(job_id: str):
+    """Background pipeline: queued jobs execute in one-at-a-time FIFO-ish order."""
+    with _conversion_lock:
+        job = _job(job_id)
+        if not job or job["status"] not in ("queued", "processing"):
+            return
+        job["status"] = "processing"
+        job["updated"] = time.time()
+        return _convert_serial(job_id)
+
+
+def _convert_serial(job_id: str):
     job = _job(job_id)
     if not job:
         return
@@ -467,14 +576,17 @@ def _convert(job_id: str):
         src.unlink(missing_ok=True)
         job["status"] = "telegram_sending"
         job["updated"] = time.time()
+        _save_resume(job_id, job)
         asyncio.run(_telegram_send(job, dest))
         job["telegram_uploaded"] = job.get("telegram_total", 0)
         job["status"] = "sent"
         job["updated"] = time.time()
+        _save_resume(job_id, job)
         dest.unlink(missing_ok=True)
     except Exception as exc:
         job["status"] = "failed"
         job["updated"] = time.time()
+        _save_resume(job_id, job)
         job["error"] = ("Telegram delivery / conversion failed: " + str(exc))[:500]
         log.exception("Lecture transfer failed for %s", job_id)
 
@@ -512,28 +624,97 @@ def install_relay_routes(app):
         count = body.get("segments")
         if type(count) is not int or not (1 <= count <= 10000):
             return _error("Invalid segment count", 400)
-        # Free abandoned upload slots immediately, instead of waiting for the timer.
+        resume_key = body.get("resume_key", "")
+        fingerprint = body.get("source_fingerprint", "")
+        if resume_key or fingerprint:
+            if not isinstance(resume_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", resume_key):
+                return _error("Invalid resume key", 400)
+            if not isinstance(fingerprint, str) or not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
+                return _error("Invalid media fingerprint", 400)
         _reap_abandoned_uploads()
         with _jobs_lock:
-            if sum(job["status"] in ("uploading", "processing", "telegram_sending") for job in _jobs.values()) >= MAX_JOBS:
-                active = next(
-                    (job["status"] for job in _jobs.values()
-                     if job["status"] in ("uploading", "processing", "telegram_sending")), "busy"
-                )
-                return jsonify(error=f"Job busy ({active}). Wait for it to finish, or cancel an abandoned upload.",
+            if resume_key:
+                old = next(((jid, job) for jid, job in _jobs.items()
+                           if job.get("resume_key") == resume_key), None)
+                if old:
+                    jid, job = old
+                    if job.get("source_fingerprint") != fingerprint or job["expected"] != count:
+                        return _error("Playlist changed; refusing unsafe partial resume", 409)
+                    if job["status"] in ("queued", "processing", "telegram_sending", "sent"):
+                        return jsonify(job_id=jid, status=job["status"],
+                                       received_indices=sorted(job["received"]),
+                                       resumed=True, already_finished=True), 200
+                    if job["status"] not in ("paused",):
+                        return _error("Existing upload still active; wait before retry", 429)
+                    if any(j["status"] in (("uploading",) if "_conversion_lock" in globals()
+                                                 else ("uploading", "processing", "telegram_sending"))
+                           for j in _jobs.values() if j is not job):
+                        return _error("Another job occupies upload slot", 429)
+                    job["status"] = "uploading"
+                    job["updated"] = time.time()
+                    _save_resume(jid, job)
+                    if PROGRESS_ENABLED:
+                        threading.Thread(target=_progress_notifier, args=(job,), daemon=True).start()
+                    return jsonify(job_id=jid, status="uploading", resumed=True,
+                                   received_indices=sorted(job["received"]),
+                                   bytes_cached=job["bytes"]), 200
+            # Preserve existing background Telegram pipeline when installed.
+            if "_conversion_lock" in globals():
+                if sum(j["status"] == "uploading" for j in _jobs.values()) >= MAX_JOBS:
+                    return jsonify(error="Another browser upload is active; finish it first.",
+                                   active_status="uploading"), 429
+                if sum(j["status"] in ("queued", "processing", "telegram_sending")
+                       for j in _jobs.values()) >= MAX_BACKGROUND_JOBS:
+                    return jsonify(error="Telegram processing backlog is full",
+                                   active_status="background_full"), 429
+                if shutil.disk_usage(ROOT).free < 512 * 1024**2:
+                    return _error("Insufficient free disk for another video", 507)
+            elif sum(job["status"] in ("uploading", "processing", "telegram_sending")
+                     for job in _jobs.values()) >= MAX_JOBS:
+                active = next((job["status"] for job in _jobs.values()
+                               if job["status"] in ("uploading", "processing", "telegram_sending")), "busy")
+                return jsonify(error=f"Job busy ({active}). Wait for it to finish.",
                                active_status=active), 429
             job_id = secrets.token_urlsafe(18)
             folder = ROOT / job_id
             folder.mkdir(parents=True, exist_ok=False)
             (folder / "segments").mkdir()
-            _jobs[job_id] = {"folder": folder, "created": time.time(), "updated": time.time(), "status": "uploading",
-                             "expected": count, "next": 0, "bytes": 0, "inflight_bytes": 0,
-                             "inflight": set(), "received": set(), "received_count": 0,
-                             "title": _clean_title(body.get("title")),
-                             "download_token": secrets.token_urlsafe(24), "lock": threading.Lock()}
+            _jobs[job_id] = {
+                "folder": folder, "created": time.time(), "updated": time.time(),
+                "status": "uploading", "expected": count, "next": 0,
+                "bytes": 0, "inflight_bytes": 0, "inflight": set(),
+                "received": set(), "received_count": 0,
+                "title": _clean_title(body.get("title")),
+                "download_token": secrets.token_urlsafe(24), "lock": threading.Lock(),
+                "resume_key": resume_key, "source_fingerprint": fingerprint,
+            }
+            job = _jobs[job_id]
+            _save_resume(job_id, job)
         if PROGRESS_ENABLED:
-            threading.Thread(target=_progress_notifier, args=(_jobs[job_id],), daemon=True).start()
-        return jsonify(job_id=job_id, status="uploading"), 201
+            threading.Thread(target=_progress_notifier, args=(job,), daemon=True).start()
+        return jsonify(job_id=job_id, status="uploading", resumed=False,
+                       received_indices=[]), 201
+
+    @app.post("/api/relay/<job_id>/pause")
+    def relay_pause(job_id):
+        if not _authorized():
+            return _error("Invalid upload key", 401)
+        job = _job(job_id)
+        if not job:
+            return _error("Unknown job", 404)
+        with job["lock"]:
+            if job["status"] == "paused":
+                return jsonify(status="paused", received_indices=sorted(job["received"])), 200
+            if job["status"] != "uploading":
+                return _error("Cannot pause already processed job", 409)
+            if job.get("inflight"):
+                return _error("Segment uploads still in progress; retry pause shortly", 409)
+            if not job.get("resume_key"):
+                return _error("This upload was started without resumable caching", 409)
+            job["status"] = "paused"
+            job["updated"] = time.time()
+            _save_resume(job_id, job)
+            return jsonify(status="paused", received_indices=sorted(job["received"])), 200
 
     @app.post("/api/relay/<job_id>/cancel")
     def relay_cancel(job_id):
@@ -584,8 +765,13 @@ def install_relay_routes(app):
         with job["lock"]:
             if job["status"] != "uploading":
                 return _error("Job is not uploading", 409)
-            if index in job["inflight"] or index in job["received"]:
-                return _error("Duplicate segment", 409)
+            if index in job["received"]:
+                # An earlier POST was committed but its response may have been lost.
+                # Idempotent ACK avoids corrupting or duplicating the MP4 input.
+                return jsonify(received=job["received_count"], total=job["expected"],
+                               already_received=True), 200
+            if index in job["inflight"]:
+                return _error("Duplicate segment still in progress", 409)
             if len(job["inflight"]) >= MAX_PARALLEL_SEGMENTS:
                 return _error("Too many concurrent segment requests", 429)
             job["inflight"].add(index)
@@ -644,6 +830,7 @@ def install_relay_routes(app):
                         job["next"] += 1
                 job["updated"] = time.time()
                 committed = True
+                _save_resume(job_id, job)
                 return jsonify(received=job["received_count"], total=job["expected"],
                                bytes=job["bytes"], contiguous=job["next"])
         except OSError:
@@ -660,7 +847,6 @@ def install_relay_routes(app):
             part.unlink(missing_ok=True)
             if not committed:
                 ready.unlink(missing_ok=True)
-
 
     # LECTURE_SITE_THUMB_V1: optional site thumbnail supplied by browser.
     @app.post("/api/relay/<job_id>/site-thumbnail")
@@ -702,10 +888,11 @@ def install_relay_routes(app):
             if (job["received_count"] != job["expected"] or
                     job["next"] != job["expected"] or job["inflight"]):
                 return _error(f"Incomplete upload: {job['received_count']}/{job['expected']}", 409)
-            job["status"] = "processing"
+            job["status"] = "queued"
             job["updated"] = time.time()
+            _save_resume(job_id, job)
             threading.Thread(target=_convert, args=(job_id,), daemon=True).start()
-        return jsonify(status="processing"), 202
+        return jsonify(status="queued", job_id=job_id), 202
 
     @app.get("/api/relay/<job_id>/status")
     def relay_status(job_id):
@@ -716,6 +903,7 @@ def install_relay_routes(app):
             return _error("Unknown/expired job", 404)
         res = {"status": job["status"], "received": job.get("received_count", job["next"]), "total": job["expected"],
                "bytes": job["bytes"], "title": job["title"]}
+        res["received_indices"] = sorted(job["received"])
         if job["status"] == "telegram_sending":
             res["telegram_uploaded"] = job.get("telegram_uploaded", 0)
             res["telegram_total"] = job.get("telegram_total", 0)
