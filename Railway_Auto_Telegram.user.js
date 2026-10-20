@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.8.0-class-notes
+// @version      2.8.1-stuck-429-recovery
 // @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
 // @match        *://*/*
 // @grant        GM_getValue
@@ -375,8 +375,36 @@
         resumeKey = [...bytes].map(b => b.toString(16).padStart(2,'0')).join('');
         localStorage.setItem(storageKey, JSON.stringify({resume_key: resumeKey, source_fingerprint: sourceFingerprint}));
       }
-      const job = await api('/api/relay/start', key, {segments: segments.length, title,
-        resume_key: resumeKey, source_fingerprint: sourceFingerprint});
+      // Recovery of the SAME lecture, never a global server reset.
+      // If a previous browser was force-stopped, Railway may still consider
+      // its job uploading; recover the cached job then resume its TS segments.
+      const startBody = {segments: segments.length, title,
+        resume_key: resumeKey, source_fingerprint: sourceFingerprint};
+      sessionStorage.setItem('lecture-relay-recover-identity-v1', JSON.stringify({resume_key:resumeKey, source_fingerprint:sourceFingerprint}));
+      let job;
+      try {
+        job = await api('/api/relay/start', key, startBody);
+      } catch (startError) {
+        if (!/\b429\b|HTTP 429/i.test(String(startError.message || startError)) ||
+            !/existing upload still active/i.test(String(startError.message || startError))) throw startError;
+        say('♻ Existing lecture upload is stuck. Recovering cached segments…');
+        let recovered = false;
+        for (let attempt = 0; attempt < 15; attempt++) {
+          const reply = await fetch(RELAY + '/api/relay/recover', {
+            method: 'POST', headers: {'Content-Type':'application/json', ...(key ? {'X-Relay-Key':key} : {})},
+            body: JSON.stringify({resume_key:resumeKey, source_fingerprint:sourceFingerprint})
+          });
+          if (reply.ok) { recovered = true; break; }
+          if (reply.status !== 409) {
+            let detail = ''; try { detail = (await reply.json()).error || ''; } catch (_) {}
+            throw new Error('Relay recovery HTTP ' + reply.status + ': ' + detail);
+          }
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+        if (!recovered) throw new Error('Previous segment requests still running; retry after they finish. Cache preserved.');
+        job = await api('/api/relay/start', key, startBody);
+        say('✅ Previous Railway upload recovered; cached segments reused.');
+      }
       // SITE-THUMB-V1: attach this lecture's website thumbnail to Telegram video.
       // This never blocks segment upload if the image is absent/unavailable.
       const originalThumb = new URLSearchParams(location.search).get('video_img') || '';

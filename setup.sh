@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 cd /lecture-bridge
-printf 'Lecture PDF notes + thumbnail deploy (existing Railway backend).\n'
+printf 'Lecture 429 recovery + PDF notes + thumbnail deploy (existing Railway backend).\n'
 printf 'WARNING: wait for browser uploads, FFmpeg conversion AND Telegram sends to finish.\n'
 read -r -p 'All transfers idle? Type IDLE to deploy: ' answer </dev/tty
 [[ "$answer" == 'IDLE' ]] || { echo 'No change made.'; exit 2; }
@@ -25,6 +25,7 @@ assert '_lecture_site_thumbnail(' in py and 'send_video(' in py
 assert '/site-thumbnail' in js and 'video_img' in js
 assert '/notes' in api and '_telegram_send_notes(' in api
 assert 'send_telegram_pdf(' in py and 'GM_getValue' in js
+assert 'def relay_recover()' in api and '/api/relay/recover' in js
 print('Compatibility checks passed.')
 PY
 mkdir -p .thumbnail_backups
@@ -48,6 +49,6 @@ if [[ "$status" != '200' ]]; then
   echo "WARNING: health=$status; rollback using .thumbnail_backups, check logs."
   exit 5
 fi
-echo 'SUCCESS: PDF notes + thumbnail backend updated, 8090 returned health 200.'
+echo 'SUCCESS: 429 recovery + PDF notes + thumbnail backend updated, 8090 returned health 200.'
 echo 'In Chrome, replace existing Tampermonkey uploader code with Railway_Auto_Telegram.user.js (from the ZIP).'
 echo 'Local edits backed up under /lecture-bridge/.thumbnail_backups/.'

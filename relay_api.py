@@ -727,6 +727,44 @@ def install_relay_routes(app):
         return jsonify(job_id=job_id, status="uploading", resumed=False,
                        received_indices=[]), 201
 
+    @app.post("/api/relay/recover")
+    def relay_recover():
+        """Explicit same-resume-owner recovery. Preserve disk cache and never stop conversion/TG.
+
+        A crashed browser may lose its job_id; the stable resume identity is
+        sufficient to release *its own* upload without touching unrelated jobs.
+        """
+        if not _authorized():
+            return _error("Invalid upload key", 401)
+        body = request.get_json(silent=True) or {}
+        rk, fp = body.get("resume_key"), body.get("source_fingerprint")
+        if not isinstance(rk, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", rk):
+            return _error("Invalid resume key", 400)
+        if not isinstance(fp, str) or not re.fullmatch(r"[a-f0-9]{64}", fp):
+            return _error("Invalid source fingerprint", 400)
+        with _jobs_lock:
+            match = next(((jid, j) for jid, j in _jobs.items()
+                          if j.get("resume_key") == rk and j.get("source_fingerprint") == fp), None)
+            if not match:
+                return _error("No cached upload for this lecture", 404)
+            jid, job = match
+            if not job["lock"].acquire(blocking=False):
+                return _error("Upload request still completing; retry", 409)
+            try:
+                if job["status"] == "paused":
+                    return jsonify(job_id=jid, status="paused", received_indices=sorted(job["received"])), 200
+                if job["status"] != "uploading":
+                    return jsonify(job_id=jid, status=job["status"], already_finished=True,
+                                   received_indices=sorted(job["received"])), 200
+                if job.get("inflight"):
+                    return _error("Segment uploads in flight; retry recovery", 409)
+                job["status"] = "paused"
+                job["updated"] = time.time()
+                _save_resume(jid, job)
+                return jsonify(job_id=jid, status="paused", received_indices=sorted(job["received"])), 200
+            finally:
+                job["lock"].release()
+
     @app.post("/api/relay/<job_id>/pause")
     def relay_pause(job_id):
         if not _authorized():

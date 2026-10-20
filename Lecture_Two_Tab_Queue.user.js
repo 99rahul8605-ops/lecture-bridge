@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Two-Tab Queue Manager
 // @namespace    lecture-bridge-queue
-// @version      1.1.0-resume
+// @version      1.2.2-force-stop-429-recovery
 // @description  Queue actual authorized lecture page URLs in a browsing tab. A separate worker tab runs the existing one-click Telegram uploader and shows queue stats. Does not alter media handling.
 // @match        https://vidcloud.eu.org/index.php*
 // @match        https://vidcloud.eu.org/play.php*
@@ -21,9 +21,10 @@
  */
 (() => {
   'use strict';
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.2';
   const STORAGE_KEY = 'lecture-two-tab-queue-v1';
   const LEASE_KEY = 'lecture-two-tab-queue-lease-v1';
+  const FORCE_KEY = 'lecture-two-tab-force-stop-v1';
   const TAB_KEY = 'lecture-two-tab-worker-id';
   const ACTIVE_UPLOAD_TAB_KEY = 'lecture-two-tab-active-upload-id';
   const MAX_QUEUE = 60;
@@ -158,6 +159,7 @@
       <button type="button" data-action="add">+ Add this lecture</button>
       <button type="button" data-action="start">▶ Start worker HERE</button>
       <button type="button" data-action="stop">⏸ Stop after current</button>
+      <button type="button" data-action="forceStop">🛑 Force Stop & Clear All (keep cache)</button>
       <button type="button" data-action="clear">Clear finished</button>
       <button type="button" data-action="clearAttention">Clear failed only</button>
       <button type="button" data-action="retryFailed">↻ Retry failed</button>
@@ -183,6 +185,7 @@
       border-radius:6px!important;padding:6px 8px!important;cursor:pointer!important;font:12px system-ui!important;
       box-shadow:none!important;display:inline-block!important}
     #lecture-two-tab-queue-panel button:disabled{opacity:.45!important;cursor:not-allowed!important}
+    #lecture-two-tab-queue-panel button[data-action="forceStop"]{background:#9d3131!important}
     #lecture-two-tab-queue-panel .ltq-counts{font:12px/1.5 ui-monospace,monospace!important;color:#b4e7ff!important;margin:3px 0!important}
     #lecture-two-tab-queue-panel .ltq-message{color:#ffe7a9!important;overflow-wrap:anywhere!important;margin:5px 0!important}
     #lecture-two-tab-queue-panel .ltq-list{padding-left:20px!important;margin:5px 0!important;max-height:120px!important;overflow:auto!important}
@@ -262,6 +265,101 @@
     mutate(s=>{s.run=false;return s;});
     toast('⏸ Stop requested. Current upload (if any) can finish.');
   }
+  // Cross-tab force stop. Explicitly pause Railway's resumable job after
+  // the browser leaves the player, so in-flight uploads have time to terminate.
+  // IMPORTANT: never use /cancel here; /cancel deletes saved Railway bytes.
+  const PAUSE_PENDING_KEY = 'lecture-two-tab-pause-pending-v2';
+  const PAUSE_ENDPOINT = 'https://ubuntu-production-9d09.up.railway.app/api/relay/';
+  let lastForceToken = String(GM_getValue(FORCE_KEY, '') || '');
+  let stoppingNow = false;
+  let pausingPending = false;
+
+  async function pausePendingRelay() {
+    if (pausingPending) return;
+    const id = sessionStorage.getItem(PAUSE_PENDING_KEY);
+    let identity = null;
+    try { identity = JSON.parse(sessionStorage.getItem('lecture-relay-recover-identity-v1') || 'null'); } catch (_) {}
+    if (!id && !(identity && identity.resume_key && identity.source_fingerprint)) return;
+    pausingPending = true;
+    try {
+      // The player page has been left, aborting its outstanding segment fetches.
+      // Retry transient 409 while server finishes the last in-flight request.
+      for (let attempt = 1; attempt <= 40; attempt++) {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 5000);
+          let response;
+          try {
+            const useIdentity = !id && identity && identity.resume_key && identity.source_fingerprint;
+            response = await fetch(useIdentity ? PAUSE_ENDPOINT + 'recover' : PAUSE_ENDPOINT + encodeURIComponent(id) + '/pause', {
+              method: 'POST', headers: {'Content-Type':'application/json'},
+              body: useIdentity ? JSON.stringify(identity) : '{}', signal: controller.signal
+            });
+          } finally { clearTimeout(timeout); }
+          if (response.ok) {
+            sessionStorage.removeItem(PAUSE_PENDING_KEY);
+            sessionStorage.removeItem('lecture-relay-current-job-v1');
+            toast('✅ Browser stopped; Railway upload PAUSED. Cached segments kept.');
+            return;
+          }
+          if (response.status !== 409) {
+            let detail = '';
+            try { detail = (await response.json()).error || ''; } catch (_) {}
+            toast('⚠️ Railway pause failed HTTP ' + response.status + (detail ? ': ' + detail : '') + '. Cache not deleted.');
+            return;
+          }
+          // 409 may mean a segment is still being written, or job moved onward.
+          // Wait and retry; never claim success before a 200 response.
+        } catch (error) {
+          console.warn('[Lecture queue] Pause retry', attempt, error);
+        }
+        if (attempt < 40) await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      toast('⚠️ Railway pause not confirmed after retries. Cache kept; wait for server idle timeout before retrying.');
+    } finally { pausingPending = false; }
+  }
+
+  function actOnForceStop() {
+    if (stoppingNow) return;
+    stoppingNow = true;
+    const jobId = sessionStorage.getItem('lecture-relay-current-job-v1');
+    if (jobId) sessionStorage.setItem(PAUSE_PENDING_KEY, jobId);
+    // Navigate FIRST: browser segment requests terminate. The destination
+    // page then retries /pause until there are no more in-flight writes.
+    if (location.pathname === '/play.php') {
+      location.replace('https://vidcloud.eu.org/index.php');
+    } else {
+      toast('🛑 Queue stopped. Releasing Railway slot (cache kept)...');
+      void pausePendingRelay();
+    }
+  }
+  function checkForceToken() {
+    const token = String(GM_getValue(FORCE_KEY, '') || '');
+    if (!token || token === lastForceToken) return;
+    lastForceToken = token;
+    const sender = senderElements();
+    if (sender?.btn.disabled || sessionStorage.getItem('lecture-relay-current-job-v1')) {
+      actOnForceStop();
+    } else if (localWorkerId && location.pathname === '/play.php') {
+      actOnForceStop();
+    }
+  }
+  try { GM_addValueChangeListener(FORCE_KEY, checkForceToken); } catch (_) {}
+  setInterval(checkForceToken, 400);
+  // Persisted in sessionStorage across play.php -> index.php navigation.
+  // Survives reload on the same worker tab, unlike a one-shot fetch.
+  if (sessionStorage.getItem(PAUSE_PENDING_KEY) || sessionStorage.getItem('lecture-relay-recover-identity-v1'))
+    setTimeout(() => void pausePendingRelay(), 300);
+
+  function forceStopClearAll() {
+    if (!confirm('FORCE STOP? Browser queue stops now. Railway cached segments are KEPT. Already-started conversion/Telegram sending can continue.')) return;
+    save(QueueCore.empty());
+    GM_setValue(LEASE_KEY, {owner:null, until:0});
+    const token = Date.now() + '-' + Math.random().toString(36).slice(2);
+    GM_setValue(FORCE_KEY, token);
+    checkForceToken();
+    toast('🛑 Queue cleared; stop sent to worker. Railway pause confirmation may take a few seconds.');
+  }
   function clearFinished() {
     mutate(s=>{s.items=s.items.filter(x=>!['relay_accepted','telegram_sent'].includes(x.status));return s;});
     toast('Completed queue entries cleared.');
@@ -301,6 +399,7 @@
     if(action==='add')addCurrent();
     else if(action==='start')startWorker();
     else if(action==='stop')stopWorker();
+    else if(action==='forceStop')forceStopClearAll();
     else if(action==='clear')clearFinished();
     else if(action==='clearAttention')clearAttention();
     else if(action==='retryFailed')retryFailed();
