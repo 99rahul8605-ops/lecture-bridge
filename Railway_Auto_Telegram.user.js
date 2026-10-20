@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.7.1-conflict-safe
+// @version      2.7.2-site-thumbnail
 // @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
 // @match        https://vidcloud.eu.org/play.php*
 // @run-at       document-idle
@@ -338,6 +338,19 @@
       }
       const job = await api('/api/relay/start', key, {segments: segments.length, title,
         resume_key: resumeKey, source_fingerprint: sourceFingerprint});
+      // SITE-THUMB-V1: attach this lecture's website thumbnail to Telegram video.
+      // This never blocks segment upload if the image is absent/unavailable.
+      const originalThumb = new URLSearchParams(location.search).get('video_img') || '';
+      if (originalThumb) {
+        try {
+          const imageURL = new URL(originalThumb, location.origin);
+          if (imageURL.protocol === 'https:' &&
+              ['static.pw.live', 'vidcloud.eu.org'].includes(imageURL.hostname)) {
+            await api(`/api/relay/${encodeURIComponent(job.job_id)}/site-thumbnail`, key,
+              {url: imageURL.href});
+          }
+        } catch (_) { /* Keep upload working even if thumbnail is unavailable. */ }
+      }
       if (job.already_finished) {
         localStorage.removeItem(storageKey);
         say(`✅ All ${segments.length} segments safely uploaded; Telegram delivery is already running or complete.`);
@@ -347,6 +360,7 @@
       const pendingIndexes = segments.map((_,i) => i).filter(i => !cached.has(i));
       if (job.resumed && cached.size) say(`♻ Resuming ${title}: ${cached.size}/${segments.length} segments already on Railway.`);
       uploadJobId = job.job_id;
+      sessionStorage.setItem('lecture-relay-current-job-v1', String(uploadJobId));
       // Bounded parallel pipeline. Each lane fetches and posts one segment at a time.
       // Server accepts out-of-order indexes, but commits input.ts strictly 0,1,2,...
       const CONCURRENCY = Math.max(1, Math.min(3, Number(lanes.value) || 2));
@@ -484,6 +498,7 @@
       console.error('[Railway MP4 link]', e);
     } finally {
       if (statsTimer !== null) clearInterval(statsTimer);
+      sessionStorage.removeItem('lecture-relay-current-job-v1');
       button.disabled = false;
       lanes.disabled = false;
     }

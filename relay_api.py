@@ -311,6 +311,52 @@ def _telegram_caption(title: str, meta: dict[str, Any], size: int) -> str:
             f"📺 {meta['width']}×{meta['height']}  •  MP4")
 
 
+
+# LECTURE_SITE_THUMB_V1: keep original website thumbnail as Telegram video cover.
+def _lecture_site_thumbnail(job, file_path, duration):
+    """Use only allowlisted public HTTPS thumbnail origins; fallback to video frame."""
+    import urllib.parse, urllib.request, ipaddress, socket
+    raw = job.get("site_thumbnail_url") or ""
+    fallback = lambda: _extract_thumbnail(file_path, job["folder"], duration)
+    try:
+        u = urllib.parse.urlsplit(raw)
+        host = (u.hostname or "").lower().rstrip(".")
+        allowed = {"static.pw.live", "vidcloud.eu.org"}
+        if u.scheme != "https" or host not in allowed or u.username or u.password or u.port not in (None,443):
+            return fallback()
+        # No redirects to other origins or internal networks.
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise ValueError("Thumbnail redirect blocked")
+        opener = urllib.request.build_opener(NoRedirect)
+        req = urllib.request.Request(raw, headers={"User-Agent": "LectureBridgeThumbnail/1.0", "Accept":"image/jpeg,image/png,image/webp,image/*"})
+        with opener.open(req, timeout=8) as response:
+            if response.status != 200:
+                return fallback()
+            declared = response.headers.get("Content-Type", "").split(";",1)[0].lower()
+            if declared not in ("image/jpeg","image/png","image/webp","image/avif","application/octet-stream"):
+                return fallback()
+            payload = response.read(2 * 1024 * 1024 + 1)
+            if len(payload) > 2 * 1024 * 1024 or len(payload) < 100:
+                return fallback()
+        # Validate actual image content through FFmpeg, never trust its extension.
+        original = job["folder"] / "lecture_site_thumbnail.original"
+        target = job["folder"] / "lecture_site_thumbnail.jpg"
+        original.write_bytes(payload)
+        try:
+            proc = subprocess.run(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", str(original),
+                "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-frames:v", "1",
+                "-q:v", "4", str(target)], capture_output=True, timeout=20)
+            if proc.returncode == 0 and target.is_file() and 1000 < target.stat().st_size <= 200*1024:
+                return target
+        finally:
+            original.unlink(missing_ok=True)
+            if target.is_file() and target.stat().st_size > 200*1024:
+                target.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return fallback()
+
 async def _telegram_send(job: dict[str, Any], file_path: Path):
     """Send real Telegram VIDEO (thumbnail + video metadata), not generic document.
 
@@ -329,7 +375,7 @@ async def _telegram_send(job: dict[str, Any], file_path: Path):
     session = str(ROOT / "lecture_relay_bot")
     client = TelegramClient(session, api_id, api_hash)
     meta = _probe_video(file_path)
-    thumb = _extract_thumbnail(file_path, job["folder"], meta["duration"])
+    thumb = _lecture_site_thumbnail(job, file_path, meta["duration"])
     job["telegram_uploaded"] = 0
     job["telegram_total"] = file_path.stat().st_size
     job["telegram_started"] = time.time()
@@ -614,6 +660,34 @@ def install_relay_routes(app):
             part.unlink(missing_ok=True)
             if not committed:
                 ready.unlink(missing_ok=True)
+
+
+    # LECTURE_SITE_THUMB_V1: optional site thumbnail supplied by browser.
+    @app.post("/api/relay/<job_id>/site-thumbnail")
+    def relay_site_thumbnail(job_id):
+        if not _authorized():
+            return _error("Unauthorized", 401)
+        job = _job(job_id)
+        if not job:
+            return _error("Job not found", 404)
+        data = request.get_json(silent=True) or {}
+        value = data.get("url") or ""
+        if not isinstance(value, str) or len(value) > 2048:
+            return _error("Invalid image URL", 400)
+        from urllib.parse import urlsplit
+        try:
+            u = urlsplit(value)
+            valid = (u.scheme == "https" and (u.hostname or "").lower() in
+                     {"static.pw.live", "vidcloud.eu.org"} and
+                     not u.username and not u.password and u.port in (None,443))
+        except Exception:
+            valid = False
+        if not valid:
+            return jsonify(status="ignored", reason="thumbnail host not allowed"), 200
+        if job.get("status") not in ("uploading", "paused"):
+            return jsonify(status="ignored", reason="job already processing"), 200
+        job["site_thumbnail_url"] = value
+        return jsonify(status="saved"), 200
 
     @app.post("/api/relay/<job_id>/finish")
     def relay_finish(job_id):
