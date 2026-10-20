@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Lecture Auto Send to Telegram
 // @namespace    lecture-bridge
-// @version      2.7.2-site-thumbnail
+// @version      2.8.0-class-notes
 // @description  Upload authorized lecture to Railway, convert to MP4 and send automatically via Telegram bot.
-// @match        https://vidcloud.eu.org/play.php*
+// @match        *://*/*
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -17,6 +19,43 @@
  */
 (() => {
   'use strict';
+  // Runs on the Notes folder too, even when it lives on another hostname.
+  // On unrelated pages, exit without showing UI or making requests.
+  const NOTES_STORE = 'lecture-relay-pdf-notes-v1';
+  const normalize = value => String(value || '').toLowerCase()
+    .replace(/\s*:\s*class notes\s*$/i, '').replace(/[^a-z0-9]+/g, ' ').trim();
+  const notesButtons = [...document.querySelectorAll('button[onclick*="downloadPDF"]')];
+  if (notesButtons.length && !/\/play\.php$/i.test(location.pathname)) {
+    const saved = GM_getValue(NOTES_STORE, {});
+    let count = 0;
+    for (const btn of notesButtons) {
+      const card = btn.closest('.ss-content-card') || btn.closest('.card') || btn.parentElement?.parentElement;
+      const noteTitle = (card?.innerText || '').trim().split('\n')[0].trim();
+      const raw = btn.getAttribute('onclick') || '';
+      const m = raw.match(/downloadPDF\s*\(\s*['"](https:\/\/[^'"]+\.pdf(?:\?[^'"]*)?)['"]/i);
+      if (!m || !noteTitle || !/class notes/i.test(noteTitle)) continue;
+      let pdf;
+      try { pdf = new URL(m[1]); } catch { continue; }
+      if (pdf.protocol !== 'https:') continue;
+      const key = normalize(noteTitle);
+      if (!key) continue;
+      saved[key] = {title: noteTitle.slice(0, 150), url: pdf.href, savedAt: Date.now(), source: location.hostname};
+      count++;
+    }
+    if (count) {
+      GM_setValue(NOTES_STORE, saved);
+      console.info(`[Lecture Bridge] Saved ${count} class-note PDF links. Open the matching video page to upload video + notes.`);
+      const banner = document.createElement('div');
+      banner.textContent = `✅ Lecture Bridge: ${count} PDF notes saved for Telegram`;
+      Object.assign(banner.style, {position:'fixed',right:'12px',bottom:'12px',zIndex:'2147483647',
+        padding:'10px',background:'#136b39',color:'#fff',borderRadius:'8px',font:'13px system-ui'});
+      document.body.appendChild(banner);
+      setTimeout(() => banner.remove(), 7000);
+    }
+    return;
+  }
+  if (location.hostname !== 'vidcloud.eu.org' || location.pathname !== '/play.php') return;
+
   let RELAY = 'https://ubuntu-production-9d09.up.railway.app'; // Railway bridge (edit only if using another host)
   const WIDGET_ID = 'railway-lecture-link-v1';
   if (document.getElementById(WIDGET_ID)) return;
@@ -350,6 +389,35 @@
               {url: imageURL.href});
           }
         } catch (_) { /* Keep upload working even if thumbnail is unavailable. */ }
+      }
+      // Optional PDF transfer: fetch only the matching notes document, never a fuzzy match.
+      // Upload BEFORE /finish so Telegram sends the PDF after its video.
+      if (!job.already_finished) {
+        const matched = GM_getValue(NOTES_STORE, {})[normalize(title)];
+        if (matched && matched.url && Date.now() - matched.savedAt < 30 * 86400000) {
+          try {
+            const pdfUrl = new URL(matched.url);
+            if (pdfUrl.protocol !== 'https:' || !/\.pdf$/i.test(pdfUrl.pathname)) throw new Error('Not HTTPS PDF');
+            say(`📄 Matching notes found: ${matched.title}. Fetching PDF…`);
+            const pdfReply = await fetch(pdfUrl.href, {mode:'cors'});
+            if (!pdfReply.ok) throw new Error(`PDF fetch HTTP ${pdfReply.status}`);
+            const length = Number(pdfReply.headers.get('content-length') || 0);
+            if (length > 25 * 1024 * 1024) throw new Error('PDF over 25 MiB');
+            const pdfBytes = await pdfReply.arrayBuffer();
+            const header = new Uint8Array(pdfBytes.slice(0, 5));
+            if (pdfBytes.byteLength > 25 * 1024 * 1024 ||
+                [37,80,68,70,45].some((b,i) => header[i] !== b)) throw new Error('Invalid PDF data');
+            const pdfUpload = await fetch(RELAY + `/api/relay/${encodeURIComponent(job.job_id)}/notes`, {
+              method:'POST', headers:{'Content-Type':'application/octet-stream',
+                'X-Notes-Title': matched.title, ...(key ? {'X-Relay-Key':key} : {})}, body:pdfBytes
+            });
+            if (!pdfUpload.ok) throw new Error(`Railway PDF HTTP ${pdfUpload.status}`);
+            say(`✅ PDF queued: ${matched.title}. Video upload continuing…`);
+          } catch (notesErr) {
+            console.warn('[Lecture Bridge] Optional PDF skipped:', notesErr.message);
+            say(`⚠ PDF skipped (${notesErr.message}); video still uploads normally.`);
+          }
+        }
       }
       if (job.already_finished) {
         localStorage.removeItem(storageKey);

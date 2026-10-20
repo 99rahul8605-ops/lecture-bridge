@@ -515,6 +515,27 @@ async def _telegram_send(job: dict[str, Any], file_path: Path):
                 thumb.unlink(missing_ok=True)
 
 
+async def _telegram_send_notes(job: dict[str, Any], notes_path: Path) -> None:
+    """Deliver an optional uploaded class-notes PDF as a Telegram document."""
+    label = re.sub(r"[\x00-\x1f<>]", "", str(job.get("notes_title") or "Class Notes"))[:150]
+    if os.getenv("TELEGRAM_SENDER", "pyrogram").strip().lower() == "pyrogram":
+        from relay_sender_pyrogram import send_telegram_pdf
+        await send_telegram_pdf(job, notes_path, label)
+        return
+    from telethon import TelegramClient
+    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = os.environ["TELEGRAM_CHAT_ID"].strip()
+    chat_id = int(chat) if re.fullmatch(r"-?\d+", chat) else chat
+    client = TelegramClient(str(ROOT / "lecture_relay_bot"),
+                            int(os.environ["TELEGRAM_API_ID"]), os.environ["TELEGRAM_API_HASH"])
+    try:
+        await client.start(bot_token=token)
+        await client.send_file(chat_id, str(notes_path), caption=label,
+                               force_document=True, mime_type="application/pdf")
+    finally:
+        await client.disconnect()
+
+
 def _convert(job_id: str):
     """Background pipeline: queued jobs execute in one-at-a-time FIFO-ish order."""
     with _conversion_lock:
@@ -578,6 +599,17 @@ def _convert_serial(job_id: str):
         job["updated"] = time.time()
         _save_resume(job_id, job)
         asyncio.run(_telegram_send(job, dest))
+        # Notes are optional. Never mark a successfully sent video failed due to PDF.
+        notes_file = job["folder"] / "lecture_notes.pdf"
+        if notes_file.is_file():
+            try:
+                asyncio.run(_telegram_send_notes(job, notes_file))
+                job["notes_status"] = "sent"
+            except Exception as notes_exc:
+                job["notes_status"] = "failed"
+                log.warning("Optional PDF delivery failed for %s: %s", job_id, notes_exc)
+            finally:
+                notes_file.unlink(missing_ok=True)
         job["telegram_uploaded"] = job.get("telegram_total", 0)
         job["status"] = "sent"
         job["updated"] = time.time()
@@ -602,7 +634,7 @@ def install_relay_routes(app):
             res.headers["Access-Control-Allow-Origin"] = _allowed_origin()
             res.headers["Vary"] = "Origin"
             res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            res.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Relay-Key"
+            res.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Relay-Key, X-Notes-Title"
             res.headers["Access-Control-Max-Age"] = "600"
         res.headers["X-Content-Type-Options"] = "nosniff"
         return res
@@ -875,6 +907,43 @@ def install_relay_routes(app):
         job["site_thumbnail_url"] = value
         return jsonify(status="saved"), 200
 
+    @app.post("/api/relay/<job_id>/notes")
+    def relay_notes(job_id):
+        """Receive browser-fetched PDF; accepts only a single bounded document."""
+        if not _authorized():
+            return _error("Invalid upload key", 401)
+        job = _job(job_id)
+        if not job:
+            return _error("Unknown/expired job", 404)
+        limit = 25 * 1024 * 1024
+        if request.content_length is None or not (5 <= request.content_length <= limit):
+            return _error("PDF size must be between 5 bytes and 25 MiB", 413)
+        title = request.headers.get("X-Notes-Title", "Class Notes")[:160]
+        if not re.fullmatch(r"[\w \-().:,]+", title, re.UNICODE):
+            title = "Class Notes"
+        with job["lock"]:
+            if job["status"] not in ("uploading", "paused"):
+                return _error("PDF upload closed; retry with a new video job", 409)
+            target = job["folder"] / "lecture_notes.pdf"
+            temp = job["folder"] / "lecture_notes.pdf.tmp"
+            try:
+                total = 0
+                with temp.open("wb") as fp:
+                    for chunk in iter(lambda: request.stream.read(1024 * 1024), b""):
+                        total += len(chunk)
+                        if total > limit:
+                            raise ValueError("PDF exceeds 25 MiB")
+                        fp.write(chunk)
+                if total < 5 or temp.open("rb").read(5) != b"%PDF-":
+                    raise ValueError("Data is not a PDF")
+                os.replace(temp, target)
+                job["notes_title"] = title
+                job["notes_status"] = "ready"
+            except (OSError, ValueError) as exc:
+                temp.unlink(missing_ok=True)
+                return _error(str(exc), 400)
+        return jsonify(status="ready", bytes=total), 201
+
     @app.post("/api/relay/<job_id>/finish")
     def relay_finish(job_id):
         if not _authorized():
@@ -907,6 +976,7 @@ def install_relay_routes(app):
         if job["status"] == "telegram_sending":
             res["telegram_uploaded"] = job.get("telegram_uploaded", 0)
             res["telegram_total"] = job.get("telegram_total", 0)
+        res["notes_status"] = job.get("notes_status", "none")
         if job["status"] == "sent":
             res["message"] = "Video sent to your Telegram chat"
         if job["status"] == "failed":

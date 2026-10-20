@@ -77,3 +77,30 @@ async def send_telegram_mp4(job: dict[str, Any], file_path: Path) -> None:
     finally:
         if thumb is not None:
             Path(thumb).unlink(missing_ok=True)
+
+
+async def send_telegram_pdf(job: dict[str, Any], path: Path, label: str) -> None:
+    """New client per send avoids reusing a closed Pyrogram instance."""
+    from pyrogram import Client
+    from pyrogram.enums import ParseMode
+    from pyrogram.errors import PeerIdInvalid
+    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_raw = os.environ["TELEGRAM_CHAT_ID"].strip()
+    chat_id = int(chat_raw) if re.fullmatch(r"-?\d+", chat_raw) else chat_raw
+    workdir = Path(os.getenv("RELAY_DATA_DIR", "/tmp/lecture_relay"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    client = Client("lecture_relay_pyrogram", api_id=int(os.environ["TELEGRAM_API_ID"]),
+                    api_hash=os.environ["TELEGRAM_API_HASH"], bot_token=token,
+                    workdir=str(workdir), workers=1, no_updates=True,
+                    max_concurrent_transmissions=_upload_transmissions())
+    async with client:
+        if isinstance(chat_id, int) and str(chat_id).startswith("-100"):
+            try:
+                await client.resolve_peer(chat_id)
+            except PeerIdInvalid:
+                await client.storage.update_peers([(chat_id, 0, "supergroup", None, None)])
+        result = await client.send_document(chat_id=chat_id, document=str(path),
+                                           file_name=(label[:95] or "Class Notes") + ".pdf",
+                                           caption=label, parse_mode=ParseMode.DISABLED)
+        if result is None:
+            raise RuntimeError("PDF document send was not confirmed")
