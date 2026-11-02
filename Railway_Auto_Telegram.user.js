@@ -7,7 +7,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @run-at       document-idle
-// @grant        none
+// @grant        GM_getValue
 // ==/UserScript==
 
 /*
@@ -56,7 +56,7 @@
   }
   if (location.hostname !== 'vidcloud.eu.org' || location.pathname !== '/play.php') return;
 
-  let RELAY = 'https://ubuntu-production-9d09.up.railway.app'; // Railway bridge (edit only if using another host)
+  let RELAY = 'https://die-remainder-purposes-shadows.trycloudflare.com'; // Railway bridge (edit only if using another host)
   const WIDGET_ID = 'railway-lecture-link-v1';
   if (document.getElementById(WIDGET_ID)) return;
 
