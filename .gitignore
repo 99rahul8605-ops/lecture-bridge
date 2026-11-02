@@ -3,3 +3,20 @@ __pycache__/
 .env
 *.session
 *.session-journal
+
+# VPS runtime and private data
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.bak
+*.session
+*.session-journal
+*.sqlite3
+*.mp4
+*.ts
+retry_saved_video.py

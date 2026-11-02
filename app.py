@@ -14,3 +14,6 @@ def health():
     return "OK - lecture-bridge is running", 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 install_relay_routes(app)
+
+from cloud_queue import install_cloud_routes
+install_cloud_routes(app)

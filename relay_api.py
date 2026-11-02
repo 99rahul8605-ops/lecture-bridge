@@ -618,8 +618,8 @@ def _convert_serial(job_id: str):
     except Exception as exc:
         job["status"] = "failed"
         job["updated"] = time.time()
-        _save_resume(job_id, job)
         job["error"] = ("Telegram delivery / conversion failed: " + str(exc))[:500]
+        _save_resume(job_id, job)
         log.exception("Lecture transfer failed for %s", job_id)
 
 

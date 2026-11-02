@@ -1,6 +1,14 @@
 """Pyrogram Telegram video sender for Lecture Bridge (with website thumbnail)."""
 from __future__ import annotations
 import os
+
+# PYROGRAM_LARGE_GROUP_ID_FIX_V1
+# Compatibility with supergroup IDs larger than Pyrogram's old range.
+from pyrogram import utils as _pyro_utils
+_pyro_utils.MIN_CHANNEL_ID = min(
+    _pyro_utils.MIN_CHANNEL_ID,
+    -1007852516352
+)
 import re
 import time
 from pathlib import Path
@@ -60,8 +68,18 @@ async def send_telegram_mp4(job: dict[str, Any], file_path: Path) -> None:
             if isinstance(chat_id, int) and str(chat_id).startswith("-100"):
                 try:
                     await client.resolve_peer(chat_id)
-                except PeerIdInvalid:
-                    await client.storage.update_peers([(chat_id, 0, "supergroup", None, None)])
+                except (PeerIdInvalid, ValueError, KeyError):
+                    from pyrogram import utils
+                    from pyrogram.raw.types import InputPeerChannel
+
+                    channel_id = utils.get_channel_id(chat_id)
+                    peer = InputPeerChannel(
+                        channel_id=channel_id,
+                        access_hash=0
+                    )
+                    await client.storage.update_peers([
+                        (chat_id, 0, "channel", None, None)
+                    ])
             sent_message = await client.send_video(
                 chat_id=chat_id, video=str(file_path),
                 caption=relay_api._telegram_caption(job["title"], metadata, size),
